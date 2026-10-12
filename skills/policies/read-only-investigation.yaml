@@ -1,0 +1,22 @@
+name: read-only-investigation
+description: >
+  Triage mode. The agent can look but not touch. Write tools are not even
+  listed, so the model never plans around them.
+
+allow:
+  - "cloud__get_logs"
+  - "cloud__list_*"
+
+tool_costs:
+  default: 0.5
+
+budget_inr: 50
+
+loop:
+  max_identical_calls: 3
+  max_calls_per_task: 30
+  window_seconds: 600
+
+safe_to_retry:
+  - "cloud__get_logs"
+  - "cloud__list_*"

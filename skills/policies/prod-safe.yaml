@@ -1,0 +1,34 @@
+name: prod-safe
+description: >
+  On-call agent in production. May read anything and make reversible changes.
+  Destructive actions need a human. Nothing can touch IAM.
+
+allow:
+  - "cloud__get_logs"
+  - "cloud__list_*"
+  - "cloud__scale_service"
+  - "cloud__create_instance"
+
+require_approval:
+  - "cloud__delete_*"
+
+deny:
+  - "cloud__*iam*"
+
+# Rupees per call. "default" applies to tools with no explicit cost.
+tool_costs:
+  cloud__create_instance: 250
+  cloud__scale_service: 50
+  default: 0.5
+
+budget_inr: 1000
+
+loop:
+  max_identical_calls: 3
+  max_calls_per_task: 40
+  window_seconds: 600
+
+# Only reads may be retried after a dropped connection.
+safe_to_retry:
+  - "cloud__get_logs"
+  - "cloud__list_*"
