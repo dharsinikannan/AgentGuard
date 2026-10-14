@@ -37,6 +37,29 @@ def test_fractional_paise_rejected():
         Policy.from_dict({"name": "t", "budget_inr": 0.001})
 
 
+def test_pattern_list_given_as_string_is_rejected():
+    # tuple("cloud__get_*") would contain "*", which allows every tool.
+    with pytest.raises(PolicyError, match="allow"):
+        Policy.from_dict({"name": "t", "allow": "cloud__get_*"})
+
+
+@pytest.mark.parametrize("value", ["3", True, 0, -1, 2.5])
+def test_bad_loop_limit_is_rejected(value):
+    with pytest.raises(PolicyError, match="max_identical_calls"):
+        Policy.from_dict({"name": "t", "loop": {"max_identical_calls": value}})
+
+
+@pytest.mark.parametrize("value", ["abc", "NaN", "Infinity", -5, True, [1]])
+def test_bad_money_is_rejected(value):
+    with pytest.raises(PolicyError):
+        Policy.from_dict({"name": "t", "budget_inr": value})
+
+
+def test_non_mapping_policy_is_rejected():
+    with pytest.raises(PolicyError):
+        Policy.from_dict(["name", "t"])
+
+
 def test_only_reads_are_safe_to_retry(prod_policy):
     assert prod_policy.is_safe_to_retry("cloud__list_instances")
     assert not prod_policy.is_safe_to_retry("cloud__create_instance")

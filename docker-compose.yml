@@ -1,0 +1,37 @@
+# Local infrastructure for AgentGuard: Redis (guard state) + LocalStack (local AWS).
+#   docker compose up -d        start both
+#   docker compose ps           both should be "healthy"
+#   docker compose down         stop (add -v to also wipe Redis data)
+#
+# LocalStack needs LOCALSTACK_AUTH_TOKEN (free non-commercial plan). Put it in
+# a .env file next to this one; .env is gitignored. See .env.example.
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]   # survive restarts: approvals, audit
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  localstack:
+    image: localstack/localstack:2026.10.0   # pinned: "latest" changes under you
+    ports:
+      - "127.0.0.1:4566:4566"
+    environment:
+      LOCALSTACK_AUTH_TOKEN: ${LOCALSTACK_AUTH_TOKEN:?set LOCALSTACK_AUTH_TOKEN in .env}
+      SERVICES: s3,ec2,logs,cloudwatch,autoscaling,iam,sts
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+volumes:
+  redis-data:

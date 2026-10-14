@@ -13,7 +13,7 @@ mentioned is denied: a new downstream tool is invisible until someone opts in.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Literal
@@ -61,30 +61,42 @@ class Policy:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Policy:
+        if not isinstance(data, dict):
+            raise PolicyError("policy must be a mapping")
         # Reject unknown keys: in a safety config, a typo like `require_aproval`
         # silently turning into "no approval needed" is the worst possible failure.
         unknown = set(data) - _TOP_LEVEL_KEYS
         if unknown:
             raise PolicyError(f"unknown policy keys: {sorted(unknown)}")
-        if not data.get("name"):
+        if not isinstance(data.get("name"), str) or not data["name"]:
             raise PolicyError("policy needs a name")
 
         loop_data = data.get("loop") or {}
+        if not isinstance(loop_data, dict):
+            raise PolicyError("loop must be a mapping")
         unknown_loop = set(loop_data) - _LOOP_KEYS
         if unknown_loop:
             raise PolicyError(f"unknown loop keys: {sorted(unknown_loop)}")
+        for key, value in loop_data.items():
+            # bool is a subclass of int in Python, so `true` would pass as 1.
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise PolicyError(f"loop.{key} must be a positive integer, got {value!r}")
 
-        costs = {pattern: _to_paise(v) for pattern, v in (data.get("tool_costs") or {}).items()}
+        raw_costs = data.get("tool_costs") or {}
+        if not isinstance(raw_costs, dict):
+            raise PolicyError("tool_costs must be a mapping")
+        costs = {str(pattern): _to_paise(v) for pattern, v in raw_costs.items()}
+
         return cls(
             name=data["name"],
-            description=data.get("description", ""),
-            allow=tuple(data.get("allow") or ()),
-            deny=tuple(data.get("deny") or ()),
-            require_approval=tuple(data.get("require_approval") or ()),
+            description=str(data.get("description") or ""),
+            allow=_patterns(data, "allow"),
+            deny=_patterns(data, "deny"),
+            require_approval=_patterns(data, "require_approval"),
             tool_costs_paise=costs,
             budget_paise=_to_paise(data.get("budget_inr", 0)),
             loop=LoopLimits(**loop_data),
-            safe_to_retry=tuple(data.get("safe_to_retry") or ()),
+            safe_to_retry=_patterns(data, "safe_to_retry"),
         )
 
     # ---------- questions ----------
@@ -118,10 +130,26 @@ def _matches(tool: str, patterns: tuple[str, ...]) -> bool:
     return any(fnmatchcase(tool, p) for p in patterns)
 
 
+def _patterns(data: dict[str, Any], key: str) -> tuple[str, ...]:
+    # Must be a real list. tuple("cloud__*") would split a lone string into
+    # characters, and the "*" among them matches every tool.
+    value = data.get(key)
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not all(isinstance(p, str) and p for p in value):
+        raise PolicyError(f"{key} must be a list of non-empty strings, got {value!r}")
+    return tuple(value)
+
+
 def _to_paise(rupees: Any) -> int:
     # Money as integer paise: floats can't represent 0.1 exactly, and Redis
     # INCRBY is atomic on integers. Decimal(str(x)) avoids float rounding on parse.
-    paise = Decimal(str(rupees)) * 100
-    if paise != paise.to_integral_value() or paise < 0:
+    if isinstance(rupees, bool) or not isinstance(rupees, (int, float, str)):
+        raise PolicyError(f"invalid rupee amount: {rupees!r}")
+    try:
+        paise = Decimal(str(rupees)) * 100
+    except InvalidOperation:
+        raise PolicyError(f"invalid rupee amount: {rupees!r}") from None
+    if not paise.is_finite() or paise != paise.to_integral_value() or paise < 0:
         raise PolicyError(f"invalid rupee amount: {rupees!r}")
     return int(paise)

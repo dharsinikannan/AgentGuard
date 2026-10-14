@@ -19,10 +19,18 @@ agent ──MCP──► AgentGuard ──MCP──► cloud server (· github �
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1          # macOS/Linux: source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[dev,agent]"
 
-pytest -q                             # 33 tests, ~1s, no Redis needed (fakeredis)
+pytest -q                             # 52 tests, ~2s, no Redis or API key needed
 python demo/run_demo.py               # scripted incident, no Redis needed
+```
+
+Run the LangGraph on-call agent (free Groq key from https://console.groq.com/keys):
+
+```powershell
+$env:GROQ_API_KEY = "gsk_..."
+python -m agent.run_agent                                   # in-process gateway + fakeredis
+python -m agent.run_agent --redis-url redis://localhost:6379  # real gateway + Redis; approve.py works
 ```
 
 Run the gateway for a real MCP client (needs Redis at `REDIS_URL`, default `redis://localhost:6379/0`):
@@ -48,7 +56,10 @@ Each call must carry `_meta`: `agentguard/task_id` (required) and
 | `servers/cloud_server.py` | Mock cloud MCP server |
 | `skills/policies/` | `prod-safe`, `read-only-investigation` |
 | `scripts/` | `approve.py`, `audit.py` (human side; never MCP tools) |
-| `demo/run_demo.py` | Every protection, end to end |
+| `agent/mcp_bridge.py` | MCP v2 tools → LLM tool specs; tool call → `tools/call` with `_meta` |
+| `agent/graph.py` | Hand-written LangGraph ReAct loop (agent ⇄ tools) |
+| `agent/run_agent.py` | CLI: Groq model → AgentGuard → cloud server |
+| `demo/run_demo.py` | Every protection, end to end (scripted) |
 
 ## Design decisions
 
@@ -66,6 +77,12 @@ Each call must carry `_meta`: `agentguard/task_id` (required) and
 - **`task_id` and idempotency keys are validated** against a strict charset, because they become parts of Redis keys.
 - **One supervisor task per downstream owns its connection.** anyio needs a client to be exited in the task that entered it. A failed call marks the connection broken and the supervisor reconnects.
 - **stdout is the MCP channel in stdio mode,** so all logging goes to stderr.
+- **Policy values are type-checked as well as key names.** A pattern list written as a plain string would be split into single characters, and the `"*"` among them would allow every tool. Every malformed value fails at load time, never during a live call.
+- **Own MCP→LangChain bridge instead of `langchain-mcp-adapters`.** The adapter's latest release pins `mcp<2`, and its tools can't attach per-call `_meta`. The bridge is ~60 lines.
+- **Idempotency key = the LLM's `tool_call_id`.** Re-executing the *same* tool call (resume after a crash) replays the stored result; the model *deciding again* gets a new key and counts against loop and budget limits.
+- **Own tools node instead of the prebuilt `ToolNode`.** Each call needs `_meta`. Tool calls in one model turn run sequentially, so two writes never race and the audit order matches the model's order.
+- **Blocked calls go back to the model as `ToolMessage(status="error")` with the reason.** The model can adapt instead of retrying blindly. `recursion_limit` is a second, agent-side step cap; the gateway is the one the agent can't bypass.
+- **The model is injected into the graph.** Tests drive the real graph, MCP and gateway with a scripted model: deterministic, no API key.
 - **Every decision and outcome is appended to a Redis Stream** `ag:audit:{task}`: append-only and ordered, with `XRANGE` for replay.
 
 ## Future work
