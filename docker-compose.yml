@@ -28,7 +28,8 @@ services:
       LOCALSTACK_AUTH_TOKEN: ${LOCALSTACK_AUTH_TOKEN:?set LOCALSTACK_AUTH_TOKEN in .env}
       SERVICES: s3,ec2,logs,cloudwatch,autoscaling,iam,sts
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:4566/_localstack/health"]
+      # The image ships no curl; use its own Python.
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4566/_localstack/health', timeout=3)"]
       interval: 10s
       timeout: 5s
       retries: 30

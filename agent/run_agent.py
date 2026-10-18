@@ -19,6 +19,7 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 
 import anyio
+from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.errors import GraphRecursionError
 from mcp import Client, StdioServerParameters
@@ -28,14 +29,15 @@ from agent.mcp_bridge import tool_specs
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ALERT = "ALERT [P2] api: p99 latency 2400ms for 10 minutes (threshold 500ms). Investigate and mitigate."
-DEFAULT_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+# Groq retires models often; list yours with: python -c "from groq import Groq; print([m.id for m in Groq().models.list().data])"
+DEFAULT_MODEL = "openai/gpt-oss-120b"
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="agent.run_agent")
     p.add_argument("--alert", default=DEFAULT_ALERT)
     p.add_argument("--policy", default=str(ROOT / "skills/policies/prod-safe.yaml"))
-    p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument("--model", default=os.environ.get("GROQ_MODEL", DEFAULT_MODEL))
     p.add_argument("--max-steps", type=int, default=30, help="LangGraph recursion_limit")
     p.add_argument("--task-id", default=f"incident-{int(time.time())}")
     p.add_argument("--redis-url", help="use the real stdio gateway + Redis instead of in-process")
@@ -80,6 +82,8 @@ def show(message) -> None:
 
 
 async def main() -> None:
+    # utf-8-sig: Windows Notepad may save .env with a BOM. Real env vars win (override=False).
+    load_dotenv(ROOT / ".env", encoding="utf-8-sig")
     args = parse_args()
     if not os.environ.get("GROQ_API_KEY"):
         sys.exit("Set GROQ_API_KEY first (free key: https://console.groq.com/keys)")
