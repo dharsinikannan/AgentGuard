@@ -64,7 +64,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--github-url", help="also proxy the OAuth-protected GitHub MCP server (needs --redis-url "
                                         "or a gateway started with --github-url)")
     p.add_argument("--redis-url", help="spawn the real gateway (stdio) with this Redis, instead of in-process")
-    p.add_argument("--gateway-url", help="connect to a running HTTP gateway, e.g. http://127.0.0.1:8765/mcp")
+    p.add_argument("--gateway-url", help="connect to a running HTTP gateway, e.g. http://127.0.0.1:8765/mcp; "
+                                         "LLM calls then also go through it (cost in the task budget)")
+    p.add_argument("--direct-llm", action="store_true",
+                   help="with --gateway-url: call Groq directly instead of through the gateway's LLM proxy")
     p.add_argument("--cloud", choices=["mock", "aws"], default="mock",
                    help="aws: boto3 servers on LocalStack, seeded, with simulated traffic")
     p.add_argument("--no-seed", action="store_true", help="aws: keep current LocalStack state")
@@ -212,9 +215,10 @@ async def main() -> None:
     # utf-8-sig: Windows Notepad may save .env with a BOM. Real env vars win (override=False).
     load_dotenv(ROOT / ".env", encoding="utf-8-sig")
     args = parse_args()
-    if not os.environ.get("GROQ_API_KEY"):
+    via_gateway = bool(args.gateway_url) and not args.direct_llm
+    if not via_gateway and not os.environ.get("GROQ_API_KEY"):
         sys.exit("Set GROQ_API_KEY first (free key: https://console.groq.com/keys)")
-    from groq import RateLimitError
+    from groq import APIStatusError, RateLimitError
     from langchain_groq import ChatGroq
 
     print(f"task={args.task_id} model={args.model} policy={Path(args.policy).name} cloud={args.cloud}")
@@ -230,8 +234,15 @@ async def main() -> None:
         print(f"checkpoints: {where} (thread {args.task_id})")
 
         # Free tier: 8k tokens/min. The SDK backs off and honours retry-after; 2 retries (default) isn't enough.
-        graph = build_agent(ChatGroq(model=args.model, temperature=0, max_retries=8), client, specs,
-                            checkpointer=checkpointer)
+        if via_gateway:
+            # The agent holds no provider key: AgentGuard prices, caps, forwards and bills each call.
+            llm = ChatGroq(model=args.model, temperature=0, max_retries=8, api_key="held-by-agentguard",
+                           base_url=args.gateway_url.rstrip("/").removesuffix("/mcp") + "/llm",
+                           default_headers={"X-AgentGuard-Task": args.task_id, "X-AgentGuard-User": args.user})
+            print("LLM: through AgentGuard (cost counts against the task budget)")
+        else:
+            llm = ChatGroq(model=args.model, temperature=0, max_retries=8)
+        graph = build_agent(llm, client, specs, checkpointer=checkpointer)
         # thread_id: the checkpoint thread. One task = one thread, so --resume finds it.
         config = {"configurable": {"thread_id": args.task_id, "task_id": args.task_id, "user": args.user},
                   "recursion_limit": args.max_steps}
@@ -266,6 +277,10 @@ async def main() -> None:
         except RateLimitError as e:
             print(f"\n\033[33mstopped: Groq rate limit still hit after retries ({e.message[:120]}). "
                   "Wait a minute, or try --model openai/gpt-oss-20b.\033[0m")
+        except APIStatusError as e:
+            if e.status_code not in (402, 403):
+                raise
+            print(f"\n\033[33mstopped by AgentGuard: {e.message[:200]}\033[0m")
 
         from agentguard.guard import audit_lines
         print(f"\n== audit trail ag:audit:{args.task_id}")

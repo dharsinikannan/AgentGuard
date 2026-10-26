@@ -26,6 +26,7 @@ from pathlib import Path
 
 import anyio
 import uvicorn
+from dotenv import load_dotenv
 from mcp import StdioServerParameters
 from mcp.server.stdio import stdio_server
 from redis.asyncio import Redis
@@ -34,6 +35,7 @@ from agentguard.crypto import TokenCipher
 from agentguard.env import child_env
 from agentguard.gateway import Downstream, Gateway
 from agentguard.guard import Guard
+from agentguard.llm_proxy import LLMProxy
 from agentguard.oauth import OAuthDownstream
 from agentguard.policy import Policy
 
@@ -49,6 +51,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--cloud", choices=["mock", "aws"], default="mock",
                         help="mock: in-memory cloud; aws: boto3 servers (LocalStack by default)")
+    parser.add_argument("--llm-upstream", default="https://api.groq.com/openai/v1",
+                        help="http: proxy LLM calls here at /llm (cost charged to the task budget); "
+                             "uses the gateway's GROQ_API_KEY, which agents then never need")
     parser.add_argument("--github-url", help="GitHub MCP server (OAuth-protected), e.g. http://127.0.0.1:8770/mcp; "
                                              "needs AGENTGUARD_TOKEN_KEY; users connect with agentguard.connect")
     parser.add_argument(
@@ -80,6 +85,7 @@ def downstreams_from(specs: list[str] | None, cloud: str = "mock") -> list[Downs
 
 
 async def main() -> None:
+    load_dotenv(ROOT / ".env", encoding="utf-8-sig")   # the gateway's own secrets (provider key, token key)
     args = parse_args()
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -104,7 +110,12 @@ async def main() -> None:
         else:
             # stateless_http: older-protocol clients get no session either, so no
             # client is ever pinned to one gateway process.
-            app = gateway.server.streamable_http_app(stateless_http=True, host=args.host)
+            routes = []
+            if os.environ.get("GROQ_API_KEY"):
+                routes = LLMProxy(gateway.guard, args.llm_upstream, os.environ["GROQ_API_KEY"]).routes()
+                logging.info("LLM proxy at http://%s:%d/llm -> %s", args.host, args.port, args.llm_upstream)
+            app = gateway.server.streamable_http_app(stateless_http=True, host=args.host,
+                                                     custom_starlette_routes=routes)
             logging.info("listening on http://%s:%d/mcp", args.host, args.port)
             await uvicorn.Server(uvicorn.Config(app, host=args.host, port=args.port, log_level="warning")).serve()
 

@@ -24,9 +24,11 @@ Rule = Literal["deny", "require_approval", "allow"]
 
 _TOP_LEVEL_KEYS = {
     "name", "description", "allow", "deny", "require_approval",
-    "tool_costs", "budget_inr", "loop", "safe_to_retry",
+    "tool_costs", "budget_inr", "loop", "safe_to_retry", "llm_costs", "llm_max_tokens",
 }
-_LOOP_KEYS = {"max_identical_calls", "max_calls_per_task", "window_seconds"}
+_LOOP_INT_KEYS = {"max_identical_calls", "max_calls_per_task", "window_seconds", "max_same_intent"}
+_LOOP_KEYS = _LOOP_INT_KEYS | {"intent_args"}
+_LLM_PRICE_KEYS = {"input_per_million_inr", "cached_input_per_million_inr", "output_per_million_inr"}
 
 
 class PolicyError(ValueError):
@@ -38,6 +40,18 @@ class LoopLimits:
     max_identical_calls: int = 3     # same tool + same args within the window
     max_calls_per_task: int = 50     # any tool, whole task lifetime
     window_seconds: int = 600
+    # Same *intent* with varying args (get_logs lines=5,6,7; scale replicas=4,6,8,12).
+    # None disables it. See Policy.intent_args_for() for what "intent" means.
+    max_same_intent: int | None = None
+    intent_args: dict[str, tuple[str, ...]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class LLMPrice:
+    """Paise per million tokens (integers, like all money here)."""
+    input: int
+    cached_input: int
+    output: int
 
 
 @dataclass(frozen=True)
@@ -51,6 +65,8 @@ class Policy:
     budget_paise: int = 0
     loop: LoopLimits = field(default_factory=LoopLimits)
     safe_to_retry: tuple[str, ...] = ()
+    llm_prices: dict[str, LLMPrice] = field(default_factory=dict)   # model -> price; unpriced = refused
+    llm_max_tokens: int = 2048                                       # cap on output tokens per LLM call
 
     # ---------- loading ----------
 
@@ -77,10 +93,13 @@ class Policy:
         unknown_loop = set(loop_data) - _LOOP_KEYS
         if unknown_loop:
             raise PolicyError(f"unknown loop keys: {sorted(unknown_loop)}")
-        for key, value in loop_data.items():
-            # bool is a subclass of int in Python, so `true` would pass as 1.
-            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
-                raise PolicyError(f"loop.{key} must be a positive integer, got {value!r}")
+        for key in _LOOP_INT_KEYS & set(loop_data):
+            _positive_int(loop_data[key], f"loop.{key}")
+        intent_args = loop_data.get("intent_args") or {}
+        if not isinstance(intent_args, dict):
+            raise PolicyError("loop.intent_args must map tool patterns to lists of argument names")
+        loop_data = {**loop_data, "intent_args": {
+            str(tool): _string_list(names, f"loop.intent_args[{tool}]") for tool, names in intent_args.items()}}
 
         raw_costs = data.get("tool_costs") or {}
         if not isinstance(raw_costs, dict):
@@ -97,6 +116,8 @@ class Policy:
             budget_paise=_to_paise(data.get("budget_inr", 0)),
             loop=LoopLimits(**loop_data),
             safe_to_retry=_patterns(data, "safe_to_retry"),
+            llm_prices=_llm_prices(data.get("llm_costs") or {}),
+            llm_max_tokens=_positive_int(data.get("llm_max_tokens", 2048), "llm_max_tokens"),
         )
 
     # ---------- questions ----------
@@ -124,6 +145,46 @@ class Policy:
 
     def is_safe_to_retry(self, tool: str) -> bool:
         return _matches(tool, self.safe_to_retry)
+
+    def intent_args_for(self, tool: str) -> tuple[str, ...] | None:
+        """Argument names that define a call's intent, if configured for this tool.
+        Unconfigured tools use a default (see guard.intent_key)."""
+        if tool in self.loop.intent_args:
+            return self.loop.intent_args[tool]
+        for pattern, names in self.loop.intent_args.items():
+            if fnmatchcase(tool, pattern):
+                return names
+        return None
+
+
+def _positive_int(value: Any, name: str) -> int:
+    # bool is a subclass of int in Python, so `true` would pass as 1.
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise PolicyError(f"{name} must be a positive integer, got {value!r}")
+    return value
+
+
+def _string_list(value: Any, name: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value or not all(isinstance(v, str) and v for v in value):
+        raise PolicyError(f"{name} must be a non-empty list of argument names, got {value!r}")
+    return tuple(value)
+
+
+def _llm_prices(raw: Any) -> dict[str, LLMPrice]:
+    if not isinstance(raw, dict):
+        raise PolicyError("llm_costs must map model names to prices")
+    prices = {}
+    for model, price in raw.items():
+        if not isinstance(price, dict) or set(price) - _LLM_PRICE_KEYS or                 not {"input_per_million_inr", "output_per_million_inr"} <= set(price):
+            raise PolicyError(f"llm_costs[{model}] needs input_per_million_inr and output_per_million_inr "
+                              f"(optional cached_input_per_million_inr), got {price!r}")
+        input_ = _to_paise(price["input_per_million_inr"])
+        prices[str(model)] = LLMPrice(
+            input=input_,
+            cached_input=_to_paise(price.get("cached_input_per_million_inr", price["input_per_million_inr"])),
+            output=_to_paise(price["output_per_million_inr"]),
+        )
+    return prices
 
 
 def _matches(tool: str, patterns: tuple[str, ...]) -> bool:

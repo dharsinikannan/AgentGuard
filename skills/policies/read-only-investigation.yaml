@@ -19,6 +19,24 @@ loop:
   max_identical_calls: 3
   max_calls_per_task: 30
   window_seconds: 600
+  max_same_intent: 5
+  intent_args:
+    "obs__get_*": [service]
+    cloud__get_logs: [service]
+
+# LLM calls through the gateway (/llm) are charged to the same task budget.
+# Rupees per million tokens. ILLUSTRATIVE: check console.groq.com/pricing (USD) and
+# convert. A model not listed here is refused: an unpriced model can't be budgeted.
+llm_costs:
+  openai/gpt-oss-120b:
+    input_per_million_inr: 13
+    cached_input_per_million_inr: 6.5
+    output_per_million_inr: 55
+  openai/gpt-oss-20b:
+    input_per_million_inr: 7
+    cached_input_per_million_inr: 3.5
+    output_per_million_inr: 28
+llm_max_tokens: 2048     # output cap per LLM call (and never more than the budget can pay)
 
 safe_to_retry:
   - "obs__*"

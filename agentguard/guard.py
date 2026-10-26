@@ -3,7 +3,7 @@
 For every tool call the gateway asks `Guard.check()` for a Decision. Checks run in
 a fixed order, cheapest and most absolute first:
 
-    owner -> policy -> idempotency -> loop -> budget -> approval -> allow
+    owner -> policy -> idempotency -> loop (identical, same intent, total) -> budget -> approval -> allow
 
 Some checks have side effects (claiming an idempotency key, reserving budget).
 If a *later* check refuses the call, those side effects are rolled back, so a
@@ -15,6 +15,7 @@ Every decision, and every execution outcome, is appended to the Redis Stream
 Redis keys (all prefixed `ag:`):
     idem:{task}:{key}          JSON {status, call_hash, result?}       24h
     loop:{task}:{call_hash}    INCR counter of identical calls          window
+    intent:{task}:{intent}     INCR counter of same-intent calls        window
     calls:{task}               INCR counter of all calls                24h
     spend:{task}               integer paise reserved so far            24h
     approvals:pending          HASH approval_id -> JSON request
@@ -46,6 +47,7 @@ APPROVAL_TTL_SECONDS = 3600
 AUDIT_MAXLEN = 10_000
 
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+TASK_ID_RE = _TASK_ID_RE   # public: the LLM proxy validates task ids the same way
 _IDEM_KEY_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,200}$")
 _USER_RE = re.compile(r"^[A-Za-z0-9_.@-]{1,64}$")
 
@@ -94,6 +96,33 @@ def call_hash(tool: str, args: dict[str, Any]) -> str:
     """Stable identity of a call: same tool + same args (key order ignored) -> same hash."""
     canonical = json.dumps({"tool": tool, "args": args}, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def intent_key(tool: str, args: dict[str, Any], names: tuple[str, ...] | None) -> tuple[str, str]:
+    """What a call is *trying to do*, ignoring the details it keeps varying.
+
+    With `names` (policy loop.intent_args), the intent is the tool plus those args.
+    Otherwise numbers and booleans are dropped (usually tuning knobs: lines, limit,
+    replicas) and strings are normalized (case, whitespace). Returns (hash, label).
+
+    Rule-based on purpose: deterministic and explainable. A blocked call says exactly
+    which intent repeated; an embedding threshold couldn't.
+    """
+    if names is not None:
+        picked = {k: _normalize(args.get(k)) for k in names}
+    else:
+        picked = {k: _normalize(v) for k, v in args.items() if not isinstance(v, (bool, int, float))}
+    canonical = json.dumps({"tool": tool, "args": picked}, sort_keys=True, separators=(",", ":"))
+    label = f"{tool}[{', '.join(f'{k}={v}' for k, v in sorted(picked.items()))}]"
+    return hashlib.sha256(canonical.encode()).hexdigest()[:32], label
+
+
+def _normalize(value: Any) -> Any:
+    if isinstance(value, str):
+        return " ".join(value.lower().split())
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, sort_keys=True)
+    return value
 
 
 def approval_id(task_id: str, call_hash_: str) -> str:
@@ -161,17 +190,30 @@ class Guard:
         #    refused call *is* the loop we want to catch.
         loop_key = f"ag:loop:{ctx.task_id}:{h}"
         calls_key = f"ag:calls:{ctx.task_id}"
+        intent, intent_label = intent_key(ctx.tool, ctx.args, p.intent_args_for(ctx.tool))
+        intent_counter = f"ag:intent:{ctx.task_id}:{intent}"
         async with r.pipeline(transaction=True) as pipe:
             pipe.incr(loop_key)
             pipe.expire(loop_key, p.loop.window_seconds, nx=True)
             pipe.incr(calls_key)
             pipe.expire(calls_key, TASK_TTL_SECONDS, nx=True)
-            identical, _, total, _ = await pipe.execute()
+            pipe.incr(intent_counter)
+            pipe.expire(intent_counter, p.loop.window_seconds, nx=True)
+            identical, _, total, _, same_intent, _ = await pipe.execute()
         if identical > p.loop.max_identical_calls:
             return Decision(
                 Verdict.DENY, "loop",
                 f"loop detected: {ctx.tool} called {identical} times with identical arguments "
                 f"(limit {p.loop.max_identical_calls} per {p.loop.window_seconds}s). Try a different approach.",
+            )
+        # Semantic loop: the same intent with varying arguments (lines=5,6,7...;
+        # scale replicas=4,6,8,12). Identical-args counting can't see it.
+        if p.loop.max_same_intent and same_intent > p.loop.max_same_intent:
+            return Decision(
+                Verdict.DENY, "loop",
+                f"loop detected: {intent_label} attempted {same_intent} times with varying arguments "
+                f"(limit {p.loop.max_same_intent} per {p.loop.window_seconds}s). It isn't converging: "
+                "check whether it is still needed, try something different, or stop and report.",
             )
         if total > p.loop.max_calls_per_task:
             return Decision(Verdict.DENY, "loop", f"task exceeded {p.loop.max_calls_per_task} tool calls")
@@ -300,6 +342,26 @@ class Guard:
                                   idempotency_key=ctx.idempotency_key)
                 return decision
         return None
+
+    # ------------------------------------------- budget outside tool calls
+
+    async def reserve_budget(self, task_id: str, paise: int) -> tuple[bool, int]:
+        """Reserve `paise` against the task budget, atomically (same INCRBY-then-compare
+        as tool calls). Returns (reserved?, spent before this). Used by the LLM proxy."""
+        key = f"ag:spend:{task_id}"
+        spent = await self.redis.incrby(key, paise)
+        await self.redis.expire(key, TASK_TTL_SECONDS, nx=True)
+        if spent > self.policy.budget_paise:
+            await self.redis.decrby(key, paise)
+            return False, spent - paise
+        return True, spent - paise
+
+    async def settle_budget(self, task_id: str, reserved: int, actual: int, **audit: str) -> None:
+        """Replace a reservation by the real cost, and audit it."""
+        if actual != reserved:
+            await self.redis.incrby(f"ag:spend:{task_id}", actual - reserved)
+        await self.redis.incrby(f"ag:spend:{task_id}:llm", actual)
+        await self._audit(task_id, "llm", cost=_inr(actual), **audit)
 
     # ------------------------------------------------------------ helpers
 

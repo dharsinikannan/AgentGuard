@@ -3,8 +3,8 @@
 A safety gateway for AI agents that operate cloud infrastructure. It sits between
 an agent and its MCP tools and stops:
 
-- **runaway loops**: the same call repeated, or too many calls per task
-- **runaway spend**: a per-task ₹ budget, reserved atomically before each call
+- **runaway loops**: the same call repeated, the same *intent* with varying arguments, or too many calls
+- **runaway spend**: one per-task ₹ budget for tool calls *and* the agent's own LLM tokens
 - **unapproved destructive actions**: paused until a human approves that exact call
 - **duplicate actions after a dropped connection**: idempotency keys, no blind retries of writes
 
@@ -22,10 +22,11 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1          # macOS/Linux: source .venv/bin/activate
 pip install -e ".[dev,agent,aws,ui]"
 
-pytest -q                             # 94 tests, ~2 min; 3 live ones skip without docker compose
+pytest -q                             # 114 tests, ~2 min; 3 live ones skip without docker compose
 python demo/run_demo.py               # scripted incident, no Redis needed
 python demo/reconnect_demo.py         # dropped connections + gateway restart (part B needs Redis)
 python demo/github_oauth_demo.py      # per-user OAuth, scopes, refresh, no passthrough (self-contained)
+python demo/cost_and_intent_demo.py   # semantic loops + LLM spend capped by the budget (self-contained)
 ```
 
 Run the LangGraph on-call agent. Put `GROQ_API_KEY` (free: https://console.groq.com/keys) and
@@ -40,8 +41,10 @@ python -m agent.run_agent --cloud aws --redis-url redis://localhost:6379/0
                                                   # world seeded + simulated traffic; approve.py works
 python -m servers.world seed                      # reset LocalStack to the incident start
 
-python -m agentguard --transport http --port 8765 # HTTP gateway (Streamable HTTP at /mcp)
+python -m agentguard --transport http --port 8765 # HTTP gateway: MCP at /mcp, LLM proxy at /llm
 python -m agent.run_agent --gateway-url http://127.0.0.1:8765/mcp
+                                                  # LLM calls go through the gateway too: the agent
+                                                  # needs no Groq key; tokens are billed to the task
 ```
 
 Human approval: a `require_approval` call pauses the agent (LangGraph `interrupt`); the run
@@ -107,6 +110,7 @@ Each call must carry `_meta`: `agentguard/task_id` (required) and
 | `scripts/` | `approve.py`, `audit.py` (human side; never MCP tools) |
 | `agentguard/oauth.py` | Gateway as per-user OAuth client: encrypted Redis token storage, absolute expiry, `OAuthDownstream` |
 | `agentguard/connect.py` | The human's one-time login: `python -m agentguard.connect github --user alice` |
+| `agentguard/llm_proxy.py` | OpenAI-compatible LLM proxy: price → cap output → reserve → forward with the gateway's key → bill real usage |
 | `agentguard/crypto.py` | Fernet encryption for tokens we use; SHA-256 for tokens we only verify |
 | `servers/github_server.py` | GitHub MCP server: OAuth 2.1 authorization server federating to GitHub; tools act as the user |
 | `servers/fake_github.py` | Offline GitHub: OAuth (PKCE, expiring + rotating tokens) and a small issues API |
@@ -174,6 +178,11 @@ Each call must carry `_meta`: `agentguard/task_id` (required) and
 - **Least privilege scopes, chosen by the human.** `github:read` by default; `github:write` only if granted at connect time. The SDK requests whatever the server's 401 challenges (MCP scope selection) and overwrote the human's choice, so the gateway pins the chosen scopes. The server registers clients for all *valid* scopes; each grant is per authorization. **Approval is not permission:** a human approving a comment doesn't give a read-only token write access (demo step 3).
 - **A task acts for one human, bound once** (`SET NX` on first use; later calls naming another user are denied, check `owner`). Users who haven't connected a server don't see its tools.
 - **Reconnecting takes effect immediately.** `connect` bumps a per-user generation; the gateway restarts that user's live connection, which otherwise kept the old token (and scopes) in memory.
+- **LLM spend is enforced by a proxy, not self-reported.** "The agent reports its token usage" is only as honest as the agent. The gateway exposes an OpenAI-compatible `/llm`, holds the provider key (the agent never has it, like M6's no-passthrough), and bills from the provider's own `usage`. One budget covers tools and tokens (`ag:spend:{task}`, with `:llm` for the breakdown).
+- **Output is hard-capped to what the budget can pay.** Before forwarding, the gateway sets `max_completion_tokens = min(requested, policy cap, affordable)` and reserves that worst case atomically; it refuses with 402 (no provider call) when even 64 tokens don't fit. **Input can only be estimated** (chars ÷ 3, conservative for English) because the real count needs the provider's tokenizer, so the honest guarantee is: output can't overrun, and the real bill is always charged. A mis-estimate shows up in the spend instead of being hidden, and the next call is refused. (The demo first claimed "never over budget" and printed ₹1,000.02: the fake provider over-counted input. Fixed the claim, not the evidence.)
+- **Cached prompt tokens are billed at the cached price.** Groq reports `prompt_tokens_details.cached_tokens`; a real run showed 512 of 1,188 prompt tokens cached. Prompt caching lowers the cost of each LLM call; it doesn't stop loops (that's the loop checks' job).
+- **Unpriced models are refused.** A model missing from `llm_costs` can't be budgeted, so it fails closed. Failed provider calls (429, 5xx, unreachable) cost 0, like the provider's own bill.
+- **Semantic loops by intent keys, not embeddings.** Intent = tool + the arguments that say *what* it does (policy `loop.intent_args`, e.g. `scale_service: [service]`); by default numbers/booleans are dropped (tuning knobs like `lines`, `replicas`) and text normalized. `max_same_intent` caps repeats per window. It catches every over-scaling run we recorded (api 4→6→8→10→12 is blocked at the 5th), deterministically, with a reason that names the intent. Embeddings would need a model, add latency and cost, and block on thresholds nobody can explain.
 - **Every decision and outcome is appended to a Redis Stream** `ag:audit:{task}`: append-only and ordered, with `XRANGE` for replay.
 
 ## Future work
@@ -182,6 +191,9 @@ Each call must carry `_meta`: `agentguard/task_id` (required) and
 - Stuck `in_progress` keys if the gateway crashes mid-call (today they expire after 24h).
 - Redact secrets from audited arguments.
 - **Argument-level policy rules**, e.g. `scale_service: require_approval if replicas > 6`, or only for named services. Seen in every real run: the agent scaled `api` 2 → 10–12 and the *healthy* `db` 1 → 4, and the policy allowed each step because it can only judge the tool name.
+- **Embedding-based intent** as an optional second layer, for loops that rephrase free text (log searches, comments) beyond what normalization catches.
+- **Streaming through the LLM proxy** (meter the stream, cut it at the budget) and **exact input token counts** with the provider's tokenizer.
+- Intent loops don't stop *unneeded* actions: scaling a healthy `db` 1 → 2 is one intent, twice. That needs argument-level policy rules (planned for M8).
 - **Agent → gateway authentication.** The task owner is bound once, but the agent's connection to the gateway carries no credential yet; a malicious agent process could start a *new* task naming another user. Next step: protect the gateway's own `/mcp` with OAuth so each agent connection is a user.
 - **Consent screen** on the GitHub MCP server listing requested scopes (today the GitHub login is the only consent).
 - **401 with a still-valid refresh token** (server revoked only the access token): the SDK re-authorizes instead of refreshing, so the gateway reports `not_connected`. Normal expiry never hits this (absolute expiry + early refresh).
