@@ -58,7 +58,7 @@ docker compose up -d --build        # Redis, LocalStack, fake GitHub, GitHub MCP
 start http://127.0.0.1:8501         # dashboard: overview, try it, approvals, audit
 docker compose run --rm agent       # the on-call agent works the incident (holds no API keys)
 docker compose run --rm admin python -m agentguard.connect github --user demo --headless-login demo `
-    --url http://github-mcp:8770/mcp --scopes "github:read github:write"
+    --url http://127.0.0.1:8770/mcp --scopes "github:read github:write"
 docker compose down                 # stop (-v also wipes Redis)
 ```
 
@@ -270,6 +270,7 @@ Each call must carry `_meta`: `agentguard/task_id` (required) and
 - **Embedding-based intent** as an optional second layer, for loops that rephrase free text (log searches, comments) beyond what normalization catches.
 - **Streaming through the LLM proxy** (meter the stream, cut it at the budget) and **exact input token counts** with the provider's tokenizer.
 - **Per-principal limits** (budget and loops per authenticated agent/user across tasks): closes the task-rotation gap the evals found; depends on agent → gateway authentication.
+- **Approvals and the intent limit:** a paused call and its retry after approval both count toward `max_same_intent`, so one approved action uses two of the four attempts (seen in the Docker run: the jump to 12 replicas was blocked one step earlier than the numbers alone suggest). Could count only executed or newly decided attempts.
 - **Agent → gateway authentication.** The task owner is bound once, but the agent's connection to the gateway carries no credential yet; a malicious agent process could start a *new* task naming another user. Next step: protect the gateway's own `/mcp` with OAuth so each agent connection is a user.
 - **Consent screen** on the GitHub MCP server listing requested scopes (today the GitHub login is the only consent).
 - **401 with a still-valid refresh token** (server revoked only the access token): the SDK re-authorizes instead of refreshing, so the gateway reports `not_connected`. Normal expiry never hits this (absolute expiry + early refresh).

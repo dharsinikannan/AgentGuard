@@ -8,8 +8,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_
 RUN useradd --create-home --uid 1000 agentguard
 WORKDIR /app
 
-# Dependencies first, so code changes don't reinstall them (layer cache).
-COPY pyproject.toml README.md ./
+# Dependencies first, so code changes don't reinstall them (layer cache). Only files
+# that affect dependencies: copying README.md here made every docs edit reinstall everything.
+COPY pyproject.toml ./
 COPY agentguard/__init__.py agentguard/
 COPY servers/__init__.py servers/
 COPY agent/__init__.py agent/

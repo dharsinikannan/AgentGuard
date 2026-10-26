@@ -46,7 +46,7 @@ async def main() -> None:
             req = await decide(redis, args.approval_id, approve=args.action == "approve", who=getpass.getuser())
         except KeyError as e:
             sys.exit(str(e))
-        print(f"{args.action}d {req['tool']} {json.dumps(req['args'])} for task {req['task_id']}")
+        print(f"{'approved' if args.action == 'approve' else 'rejected'} {req['tool']} {json.dumps(req['args'])} for task {req['task_id']}")
     finally:
         await redis.aclose()
 

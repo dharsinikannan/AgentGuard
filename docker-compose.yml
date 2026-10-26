@@ -5,7 +5,7 @@
 #   http://127.0.0.1:8501                   dashboard: overview, approvals, audit
 #   docker compose run --rm agent           the on-call agent works the incident
 #   docker compose run --rm admin python -m agentguard.connect github --user demo \
-#       --headless-login demo --url http://github-mcp:8770/mcp
+#       --headless-login demo --url http://127.0.0.1:8770/mcp
 #   docker compose down                     stop (add -v to also wipe Redis data)
 #
 # Secrets come from .env (see .env.example), and each service gets only the ones it
@@ -14,6 +14,11 @@
 #
 # Every port is published on 127.0.0.1 only: the gateway has no agent authentication
 # yet, and /llm spends your Groq key. Never publish these on 0.0.0.0.
+#
+# OAuth over plain HTTP is only allowed on loopback (OAuth 2.1; the MCP SDK enforces it).
+# So the gateway and the admin CLI join the GitHub MCP server's network namespace
+# ("sidecar") and reach its authorization server at http://127.0.0.1:8770: codes and
+# tokens never cross a network unencrypted. In production, put HTTPS in front instead.
 
 x-app: &app
   image: agentguard:local
@@ -67,9 +72,13 @@ services:
     command: ["python", "-m", "servers.github_server", "--host", "0.0.0.0", "--port", "8770"]
     ports:
       - "127.0.0.1:8770:8770"
+      - "127.0.0.1:8765:8765"                     # the gateway's port: it lives in this namespace
+    networks:
+      default:
+        aliases: [gateway]                        # so other containers still reach http://gateway:8765
     environment:
       PORT: "8770"
-      GITHUB_MCP_URL: http://github-mcp:8770      # its OAuth issuer + resource URL, as the gateway sees it
+      GITHUB_MCP_URL: http://127.0.0.1:8770       # issuer on loopback: allowed over HTTP, see top
       GITHUB_CLIENT_ID: Iv1.fake
       GITHUB_CLIENT_SECRET: fake-secret
       GITHUB_OAUTH_URL: http://fake-github:9100
@@ -83,11 +92,10 @@ services:
 
   gateway:
     <<: *app
+    network_mode: "service:github-mcp"           # sidecar: reaches the OAuth server on 127.0.0.1
     command: ["python", "-m", "agentguard", "--transport", "http", "--host", "0.0.0.0", "--port", "8765",
-              "--cloud", "aws", "--github-url", "http://github-mcp:8770/mcp",
+              "--cloud", "aws", "--github-url", "http://127.0.0.1:8770/mcp",
               "--redis-url", "redis://redis:6379/0"]
-    ports:
-      - "127.0.0.1:8765:8765"
     environment:
       PORT: "8765"
       GROQ_API_KEY: ${GROQ_API_KEY:-}                 # only the gateway holds it (LLM proxy)
@@ -127,6 +135,7 @@ services:
     <<: *app
     restart: "no"
     profiles: ["tools"]                                # the human's CLIs: connect, approve, audit
+    network_mode: "service:github-mcp"                # connect talks OAuth to 127.0.0.1:8770
     command: ["python", "scripts/approve.py", "list"]
     environment:
       REDIS_URL: redis://redis:6379/0
