@@ -1,4 +1,4 @@
-# Local infrastructure for AgentGuard: Redis (guard state) + LocalStack (local AWS).
+# Local infrastructure for AgentGuard: Redis (guard state + agent checkpoints) + LocalStack (local AWS).
 #   docker compose up -d        start both
 #   docker compose ps           both should be "healthy"
 #   docker compose down         stop (add -v to also wipe Redis data)
@@ -8,7 +8,8 @@
 
 services:
   redis:
-    image: redis:7.4-alpine
+    # Redis 8: JSON + Search are built in; the LangGraph Redis checkpointer needs both.
+    image: redis:8.10.2-alpine
     ports:
       - "127.0.0.1:6379:6379"
     command: ["redis-server", "--appendonly", "yes"]   # survive restarts: approvals, audit

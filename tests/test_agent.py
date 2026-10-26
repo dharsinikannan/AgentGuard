@@ -39,8 +39,9 @@ def call(name, args, id):
 
 
 @asynccontextmanager
-async def agent_stack(guard):
-    cloud_server.reset_state()
+async def agent_stack(guard, reset=True):
+    if reset:
+        cloud_server.reset_state()
     gateway = Gateway(guard, [Downstream("cloud", cloud_server.mcp)])
     async with gateway.running(), Client(gateway.server) as client:
         yield client

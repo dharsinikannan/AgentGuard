@@ -1,0 +1,7 @@
+# The approvals UI has no login yet: only reachable from this machine.
+[server]
+address = "127.0.0.1"
+headless = true
+
+[browser]
+gatherUsageStats = false

@@ -298,16 +298,32 @@ async def decide(redis: Redis, aid: str, approve: bool, who: str = "human") -> d
     if raw is None:
         raise KeyError(f"no pending approval with id {aid}")
     request = json.loads(raw)
+    # Claim the decision atomically: HDEL removes the field for exactly one caller.
+    # Read-then-write let two people click Approve and Reject at once, leaving both
+    # a grant and a rejection, and the guard checks the grant first.
+    if not await redis.hdel("ag:approvals:pending", aid):
+        raise KeyError(f"approval {aid} was already decided by someone else")
     target = f"ag:approval:{'grant' if approve else 'rejected'}:{aid}"
     async with redis.pipeline(transaction=True) as pipe:
         pipe.set(target, who, ex=APPROVAL_TTL_SECONDS)
-        pipe.hdel("ag:approvals:pending", aid)
         pipe.xadd(f"ag:audit:{request['task_id']}",
                   {"ts": f"{time.time():.3f}", "event": "approved" if approve else "rejected",
                    "tool": request["tool"], "approval_id": aid, "by": who},
                   maxlen=AUDIT_MAXLEN, approximate=True)
         await pipe.execute()
     return request
+
+
+async def approval_status(redis: Redis, aid: str) -> str:
+    """pending | approved | rejected | unknown (expired, or the grant was already used).
+    Read-only: used by the agent runner to know when to resume a paused graph."""
+    if await redis.hexists("ag:approvals:pending", aid):
+        return "pending"
+    if await redis.exists(f"ag:approval:grant:{aid}"):
+        return "approved"
+    if await redis.exists(f"ag:approval:rejected:{aid}"):
+        return "rejected"
+    return "unknown"
 
 
 async def audit_lines(redis: Redis, task_id: str) -> list[str]:

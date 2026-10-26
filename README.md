@@ -20,9 +20,9 @@ agent ──MCP──► AgentGuard ──MCP──► cloud__*  (EC2, S3)      
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1          # macOS/Linux: source .venv/bin/activate
-pip install -e ".[dev,agent,aws]"
+pip install -e ".[dev,agent,aws,ui]"
 
-pytest -q                             # 72 tests, ~40s, no Docker/Redis/API key (AWS via moto)
+pytest -q                             # 80 tests, ~90s; 3 live ones skip without docker compose
 python demo/run_demo.py               # scripted incident, no Redis needed
 python demo/reconnect_demo.py         # dropped connections + gateway restart (part B needs Redis)
 ```
@@ -41,6 +41,16 @@ python -m servers.world seed                      # reset LocalStack to the inci
 
 python -m agentguard --transport http --port 8765 # HTTP gateway (Streamable HTTP at /mcp)
 python -m agent.run_agent --gateway-url http://127.0.0.1:8765/mcp
+```
+
+Human approval: a `require_approval` call pauses the agent (LangGraph `interrupt`); the run
+is checkpointed in Redis and resumes once a human decides:
+
+```powershell
+streamlit run ui/approvals.py                     # approvals console + audit trail, http://127.0.0.1:8501
+python -m agent.run_agent --redis-url redis://localhost:6379/0 --on-approval exit --alert "...delete old-logs-2023"
+python scripts/approve.py approve <id>            # or click Approve in the UI
+python -m agent.run_agent --resume --task-id <task> --redis-url redis://localhost:6379/0
 ```
 
 Run the gateway for a real MCP client (needs Redis at `REDIS_URL`, default `redis://localhost:6379/0`):
@@ -73,8 +83,9 @@ Each call must carry `_meta`: `agentguard/task_id` (required) and
 | `docker-compose.yml` | Redis + LocalStack |
 | `skills/policies/` | `prod-safe`, `read-only-investigation` |
 | `scripts/` | `approve.py`, `audit.py` (human side; never MCP tools) |
+| `ui/approvals.py` | Streamlit approvals console: pending approvals, approve/reject, audit trail, spend |
 | `agent/mcp_bridge.py` | MCP v2 tools → LLM tool specs; tool call → `tools/call` with `_meta` |
-| `agent/graph.py` | Hand-written LangGraph ReAct loop (agent ⇄ tools) |
+| `agent/graph.py` | Hand-written LangGraph ReAct loop (agent ⇄ tools); pauses with `interrupt` for approvals |
 | `agent/run_agent.py` | CLI: Groq model → AgentGuard → cloud server |
 | `demo/run_demo.py` | Every protection, end to end (scripted) |
 | `demo/reconnect_demo.py` | Dropped connection mid-launch; gateway killed and restarted mid-task |
@@ -118,6 +129,14 @@ Each call must carry `_meta`: `agentguard/task_id` (required) and
 - **The agent resends a lost call with the same key, even writes.** It's safe only because the gateway dedupes by key. The agent's timeout (180 s) is longer than the gateway's (120 + 15 s), so the gateway records `unknown`; the agent never just hangs up first.
 - **A lost connection is never a known failure.** The SDK reports a dead connection as `MCPError(CONNECTION_CLOSED)`, synthesized locally. Treating it as "the server answered" recorded writes that may have run as failed, and the agent would redo them. A server could use -32000 itself; we still treat it as lost, erring toward a human check, never a duplicate.
 - **`SupervisedClient` unpublishes a dead connection at once** and the supervisor reconnects. An `mcp.Client` is finished for good after its connection dies, and closing it takes time; callers in that window were handed the same dead client. Waiters poll for a live client (50 ms) instead of an Event that could be swapped under them.
+- **Approval pauses the graph instead of returning an error.** On `pending_approval` the tools node calls LangGraph `interrupt()`; state is checkpointed (Redis, 24 h TTL), so the process may exit and another one resume it (`--resume`). Proven with a real model: process 1 paused and exited, a human approved from the CLI, process 2 resumed and deleted the bucket once.
+- **The gateway decides, not the resume value.** Resuming just re-sends the same call with the same key: approved → the single-use grant is consumed and it runs; rejected → the agent gets the rejection. A forged or stale resume can't approve anything.
+- **Resume re-runs the paused node from the top** (LangGraph semantics), so calls made earlier in that turn run again. Their idempotency keys make that a free replay; a test checks the earlier launch isn't repeated.
+- **One task = one checkpoint thread** (`thread_id = task_id`), so the guard's state (budget, loops, audit) and the agent's state (messages) share an identity and both survive restarts.
+- **`decide()` claims a decision with an atomic `HDEL`.** It used to read then write: Approve and Reject clicked at the same moment both succeeded, and the guard checks the grant first. Now exactly one wins.
+- **Redis 8** (`redis:8.10.2-alpine`) because the LangGraph checkpointer needs RedisJSON + RediSearch, built in since Redis 8. RediSearch indexes only work in **database 0**, so checkpoints must live there; `run_agent` refuses another db with a clear message.
+- **The approvals UI is outside MCP and bound to 127.0.0.1.** It writes to Redis directly, so the agent has no path to it. It has no login yet and approver names are self-declared.
+- **Prompt lesson:** telling the model "destructive actions need approval" made it *skip* the deletion and claim approval was pending. The prompt now says: call the tool; AgentGuard pauses and a human decides. Enforcement lives outside the model; the prompt just mustn't fight it.
 - **Every decision and outcome is appended to a Redis Stream** `ag:audit:{task}`: append-only and ordered, with `XRANGE` for replay.
 
 ## Future work
@@ -126,6 +145,7 @@ Each call must carry `_meta`: `agentguard/task_id` (required) and
 - Stuck `in_progress` keys if the gateway crashes mid-call (today they expire after 24h).
 - Redact secrets from audited arguments.
 - **Argument-level policy rules**, e.g. `scale_service: require_approval if replicas > 6`, or only for named services. Seen in every real run: the agent scaled `api` 2 → 10–12 and the *healthy* `db` 1 → 4, and the policy allowed each step because it can only judge the tool name.
+- **Approvals UI auth** (SSO/OAuth) and verified approver identity; today it's localhost-only with a self-declared name.
 - **Gateway crash mid-call**: the detached call dies with the process and the key stays `in_progress` (24 h). Needs a lease (claim with a short TTL, renewed while running) and a reaper that turns expired leases into `unknown`, never into "absent", which would allow a re-run.
 - `MCPError(INTERNAL_ERROR)` from an HTTP 5xx is still treated as a known answer; a server that crashed mid-write could have acted. Could be classified `unknown` for writes.
 - Real Auto Scaling groups instead of tagged instances (needs a paid LocalStack plan or real AWS).
