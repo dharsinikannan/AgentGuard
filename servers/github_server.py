@@ -296,7 +296,8 @@ def build_mcp(provider: GitHubFederatedProvider) -> MCPServer:
     return mcp
 
 
-def build_app(redis: Redis, cipher: TokenCipher, cfg: Config, http: httpx2.AsyncClient | None = None) -> Starlette:
+def build_app(redis: Redis, cipher: TokenCipher, cfg: Config, http: httpx2.AsyncClient | None = None,
+              host: str = "127.0.0.1") -> Starlette:
     provider = GitHubFederatedProvider(redis, cipher, cfg, http or httpx2.AsyncClient(timeout=15))
     mcp = build_mcp(provider)
     # Auth is passed to the lowlevel app explicitly: MCPServer.streamable_http_app()
@@ -305,6 +306,9 @@ def build_app(redis: Redis, cipher: TokenCipher, cfg: Config, http: httpx2.Async
     # validate_token_resource rejects tokens minted for any other server (audience).
     return mcp._lowlevel_server.streamable_http_app(
         stateless_http=True,
+        # On 127.0.0.1 the SDK only accepts localhost Host headers (DNS-rebinding
+        # protection); on 0.0.0.0 (a container) it must accept the service name.
+        host=host,
         auth=AuthSettings(
             issuer_url=cfg.base_url, resource_server_url=cfg.resource, validate_token_resource=True,
             required_scopes=["github:read"],
@@ -325,6 +329,7 @@ def main() -> None:
     load_dotenv(encoding="utf-8-sig")
     parser = argparse.ArgumentParser(prog="servers.github_server")
     parser.add_argument("--port", type=int, default=8770)
+    parser.add_argument("--host", default="127.0.0.1", help="0.0.0.0 inside a container")
     args = parser.parse_args()
     cfg = Config(
         base_url=os.environ.get("GITHUB_MCP_URL", f"http://127.0.0.1:{args.port}"),
@@ -334,8 +339,8 @@ def main() -> None:
         github_api_url=os.environ.get("GITHUB_API_URL", "https://api.github.com"),
     )
     redis = Redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
-    app = build_app(redis, TokenCipher.from_env("GITHUB_MCP_TOKEN_KEY"), cfg)
-    uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
+    app = build_app(redis, TokenCipher.from_env("GITHUB_MCP_TOKEN_KEY"), cfg, host=args.host)
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 
 if __name__ == "__main__":

@@ -128,5 +128,6 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(prog="servers.fake_github")
     parser.add_argument("--port", type=int, default=9100)
+    parser.add_argument("--host", default="127.0.0.1", help="0.0.0.0 inside a container")
     args = parser.parse_args()
-    uvicorn.run(FakeGitHub().app, host="127.0.0.1", port=args.port, log_level="warning")
+    uvicorn.run(FakeGitHub().app, host=args.host, port=args.port, log_level="warning")

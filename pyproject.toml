@@ -24,6 +24,9 @@ agent = [
 ui = [
     "streamlit>=1.40",
 ]
+demo = [
+    "fakeredis>=2.26",   # public demo mode: in-memory Redis, nothing to secure
+]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.24",

@@ -1,18 +1,31 @@
 # AgentGuard
 
-A safety gateway for AI agents that operate cloud infrastructure. It sits between
-an agent and its MCP tools and stops:
+**A safety gateway for AI agents that operate cloud infrastructure.** It sits between an agent
+and its tools (MCP) and stops what goes wrong when agents act on their own:
 
 - **runaway loops**: the same call repeated, the same *intent* with varying arguments, or too many calls
 - **runaway spend**: one per-task ₹ budget for tool calls *and* the agent's own LLM tokens
 - **unapproved destructive actions**: paused until a human approves that exact call
 - **duplicate actions after a dropped connection**: idempotency keys, no blind retries of writes
 
-```
-agent ──MCP──► AgentGuard ──MCP──► cloud__*  (EC2, S3)          ─┐
-                   │       └─MCP──► obs__*    (CloudWatch logs,   ├─ boto3 → LocalStack (or real AWS)
-                   │                           metrics)          ─┘
-                 Redis   budgets · loop counters · idempotency · approvals · audit stream
+<!-- Fill these in after publishing (see "Deploy the public demo" below): -->
+**[Live demo](https://huggingface.co/spaces/YOUR-HF-USERNAME/agentguard)** ·
+**[3-minute video](https://youtu.be/YOUR-VIDEO-ID)** ·
+**[Eval results](evals/RESULTS.md)** · **[Design decisions](#design-decisions)**
+
+```mermaid
+flowchart LR
+    A["LangGraph agent<br/>(no API keys)"] -- "MCP tool calls" --> G
+    A -- "LLM calls" --> G
+    subgraph G["AgentGuard gateway"]
+        P["owner → policy + argument rules → idempotency<br/>→ loops (identical, intent) → budget → approval"]
+    end
+    G -- "MCP" --> C["cloud: EC2, S3<br/>(LocalStack / AWS)"]
+    G -- "MCP" --> O["observability:<br/>CloudWatch"]
+    G -- "MCP + its own OAuth token" --> H["GitHub MCP server"] -- "user's GitHub token" --> GH[GitHub]
+    G -- "the gateway's key" --> L["LLM provider<br/>(Groq)"]
+    G <--> R[("Redis: budgets, loop counters,<br/>idempotency, approvals,<br/>checkpoints, audit stream")]
+    U["Dashboard:<br/>approvals, audit"] <--> R
 ```
 
 ## Results
@@ -35,10 +48,40 @@ agent → gateway connection to be authenticated (next on the Future work list).
 
 ## Quick start
 
+### Everything in Docker (one command)
+
+Needs Docker Desktop and a `.env` (copy `.env.example`): `LOCALSTACK_AUTH_TOKEN` (free Hobby plan),
+`GROQ_API_KEY` (free), and two encryption keys generated with the command shown there.
+
+```powershell
+docker compose up -d --build        # Redis, LocalStack, fake GitHub, GitHub MCP server, gateway, dashboard
+start http://127.0.0.1:8501         # dashboard: overview, try it, approvals, audit
+docker compose run --rm agent       # the on-call agent works the incident (holds no API keys)
+docker compose run --rm admin python -m agentguard.connect github --user demo --headless-login demo `
+    --url http://github-mcp:8770/mcp --scopes "github:read github:write"
+docker compose down                 # stop (-v also wipes Redis)
+```
+
+All ports bind to 127.0.0.1: the gateway has no agent authentication yet, and its `/llm` endpoint
+spends your Groq key. Never publish them on 0.0.0.0.
+
+### Public demo (no secrets) and the video
+
+```powershell
+$env:AGENTGUARD_DEMO="1"; streamlit run ui/app.py      # the demo locally: in-memory, mock cloud
+python deploy/build_space.py --space <hf-user>/agentguard   # package it as a Hugging Face Space
+```
+
+The Space runs only the dashboard in demo mode: a scripted misbehaving agent through the real
+gateway, the approval flow, and the eval suite, all in-process with no API keys or real
+infrastructure. The video script is in [docs/VIDEO.md](docs/VIDEO.md).
+
+### Local Python (development)
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1          # macOS/Linux: source .venv/bin/activate
-pip install -e ".[dev,agent,aws,ui]"
+pip install -e ".[dev,agent,aws,ui,demo]"
 
 pytest -q                             # 169 tests, ~2 min; 3 live ones skip without docker compose
 python demo/run_demo.py               # scripted incident, no Redis needed
@@ -70,7 +113,7 @@ Human approval: a `require_approval` call pauses the agent (LangGraph `interrupt
 is checkpointed in Redis and resumes once a human decides:
 
 ```powershell
-streamlit run ui/approvals.py                     # approvals console + audit trail, http://127.0.0.1:8501
+streamlit run ui/app.py                           # dashboard: approvals, audit, overview, http://127.0.0.1:8501
 python -m agent.run_agent --redis-url redis://localhost:6379/0 --on-approval exit --alert "...delete old-logs-2023"
 python scripts/approve.py approve <id>            # or click Approve in the UI
 python -m agent.run_agent --resume --task-id <task> --redis-url redis://localhost:6379/0
@@ -133,7 +176,11 @@ Each call must carry `_meta`: `agentguard/task_id` (required) and
 | `agentguard/crypto.py` | Fernet encryption for tokens we use; SHA-256 for tokens we only verify |
 | `servers/github_server.py` | GitHub MCP server: OAuth 2.1 authorization server federating to GitHub; tools act as the user |
 | `servers/fake_github.py` | Offline GitHub: OAuth (PKCE, expiring + rotating tokens) and a small issues API |
-| `ui/approvals.py` | Streamlit approvals console: pending approvals, approve/reject, audit trail, spend |
+| `ui/` | Streamlit dashboard (`app.py`): overview, try it, approvals, audit; `AGENTGUARD_DEMO=1` = public demo |
+| `agentguard/insights.py` | Read-only summaries for the dashboard; the shared in-memory store in demo mode |
+| `evals/showcase.py` | The "Try it" incident: a scripted agent through the real gateway |
+| `Dockerfile`, `docker-compose.yml` | One image for every service; the whole stack with per-service secrets |
+| `deploy/build_space.py` | Packages the public demo as a Hugging Face Space |
 | `agent/mcp_bridge.py` | MCP v2 tools → LLM tool specs; tool call → `tools/call` with `_meta` |
 | `agent/graph.py` | Hand-written LangGraph ReAct loop (agent ⇄ tools); pauses with `interrupt` for approvals |
 | `agent/run_agent.py` | CLI: Groq model → AgentGuard → cloud server |
@@ -210,6 +257,9 @@ Each call must carry `_meta`: `agentguard/task_id` (required) and
 - **The false-block rate is reported both ways** (0/110 including the 40 reads of a flood scenario, and 0/34 for good agents alone) so one scenario can't flatter it.
 - **Latency found work:** the audit write and the budget reservation were 2 Redis round-trips each; pipelining cut real-Redis overhead from +5.7 to +4.4 ms p50.
 - **The suite is also a pytest regression test** (`tests/test_evals.py`): any weakened defence fails CI with the scenario's name; the known gap must keep failing until it's fixed on purpose.
+- **Each container gets only its own secrets.** The agent gets none (its LLM calls go through the gateway); only the gateway holds the Groq key and the token-encryption key; only the GitHub MCP server holds GitHub credentials. Compose refuses to start if a required key is missing, instead of running with an empty one.
+- **The public demo has nothing worth attacking.** It's the dashboard in demo mode: an in-memory Redis inside the process, the mock cloud, no gateway port, no API keys. A public gateway would hand strangers your LLM key, since agents aren't authenticated yet.
+- **One image, many services.** Every Python service is the same image with a different command, so what's tested is what runs; it runs as a non-root user, and `.env` is excluded from the build context.
 - **Every decision and outcome is appended to a Redis Stream** `ag:audit:{task}`: append-only and ordered, with `XRANGE` for replay.
 
 ## Future work

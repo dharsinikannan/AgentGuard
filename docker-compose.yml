@@ -1,10 +1,24 @@
-# Local infrastructure for AgentGuard: Redis (guard state + agent checkpoints) + LocalStack (local AWS).
-#   docker compose up -d        start both
-#   docker compose ps           both should be "healthy"
-#   docker compose down         stop (add -v to also wipe Redis data)
+# The whole AgentGuard stack, one command.
 #
-# LocalStack needs LOCALSTACK_AUTH_TOKEN (free non-commercial plan). Put it in
-# a .env file next to this one; .env is gitignored. See .env.example.
+#   docker compose up -d --build            Redis, LocalStack, fake GitHub, GitHub MCP server,
+#                                           gateway (MCP + LLM proxy), dashboard
+#   http://127.0.0.1:8501                   dashboard: overview, approvals, audit
+#   docker compose run --rm agent           the on-call agent works the incident
+#   docker compose run --rm admin python -m agentguard.connect github --user demo \
+#       --headless-login demo --url http://github-mcp:8770/mcp
+#   docker compose down                     stop (add -v to also wipe Redis data)
+#
+# Secrets come from .env (see .env.example), and each service gets only the ones it
+# needs. Note the agent: no Groq key, no token key. Its LLM calls go through the
+# gateway, which holds the key and bills the task.
+#
+# Every port is published on 127.0.0.1 only: the gateway has no agent authentication
+# yet, and /llm spends your Groq key. Never publish these on 0.0.0.0.
+
+x-app: &app
+  image: agentguard:local
+  build: .
+  restart: unless-stopped
 
 services:
   redis:
@@ -34,6 +48,91 @@ services:
       interval: 10s
       timeout: 5s
       retries: 30
+
+  fake-github:
+    <<: *app
+    command: ["python", "-m", "servers.fake_github", "--host", "0.0.0.0", "--port", "9100"]
+    ports:
+      - "127.0.0.1:9100:9100"
+    healthcheck: &tcp-check
+      test: ["CMD", "python", "-c", "import socket,os; socket.create_connection(('localhost', int(os.environ['PORT'])), 2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    environment:
+      PORT: "9100"
+
+  github-mcp:
+    <<: *app
+    command: ["python", "-m", "servers.github_server", "--host", "0.0.0.0", "--port", "8770"]
+    ports:
+      - "127.0.0.1:8770:8770"
+    environment:
+      PORT: "8770"
+      GITHUB_MCP_URL: http://github-mcp:8770      # its OAuth issuer + resource URL, as the gateway sees it
+      GITHUB_CLIENT_ID: Iv1.fake
+      GITHUB_CLIENT_SECRET: fake-secret
+      GITHUB_OAUTH_URL: http://fake-github:9100
+      GITHUB_API_URL: http://fake-github:9100
+      GITHUB_MCP_TOKEN_KEY: ${GITHUB_MCP_TOKEN_KEY:?set GITHUB_MCP_TOKEN_KEY in .env}
+      REDIS_URL: redis://redis:6379/0
+    healthcheck: *tcp-check
+    depends_on:
+      redis: {condition: service_healthy}
+      fake-github: {condition: service_healthy}
+
+  gateway:
+    <<: *app
+    command: ["python", "-m", "agentguard", "--transport", "http", "--host", "0.0.0.0", "--port", "8765",
+              "--cloud", "aws", "--github-url", "http://github-mcp:8770/mcp",
+              "--redis-url", "redis://redis:6379/0"]
+    ports:
+      - "127.0.0.1:8765:8765"
+    environment:
+      PORT: "8765"
+      GROQ_API_KEY: ${GROQ_API_KEY:-}                 # only the gateway holds it (LLM proxy)
+      AGENTGUARD_TOKEN_KEY: ${AGENTGUARD_TOKEN_KEY:?set AGENTGUARD_TOKEN_KEY in .env}
+      AGENTGUARD_AWS_TARGET: localstack               # passed on to the AWS tool servers it spawns
+      LOCALSTACK_URL: http://localstack:4566
+    healthcheck: *tcp-check
+    depends_on:
+      redis: {condition: service_healthy}
+      localstack: {condition: service_healthy}
+      github-mcp: {condition: service_healthy}
+
+  ui:
+    <<: *app
+    command: ["streamlit", "run", "ui/app.py", "--server.address", "0.0.0.0", "--server.port", "8501"]
+    ports:
+      - "127.0.0.1:8501:8501"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis: {condition: service_healthy}
+
+  agent:
+    <<: *app
+    restart: "no"
+    profiles: ["agent"]                                # run on demand: docker compose run --rm agent
+    command: ["python", "-m", "agent.run_agent", "--gateway-url", "http://gateway:8765/mcp", "--cloud", "aws",
+              "--user", "demo"]
+    environment:
+      REDIS_URL: redis://redis:6379/0                 # human side: approvals + checkpoints
+      AGENTGUARD_AWS_TARGET: localstack               # seeds the incident + simulates traffic
+      LOCALSTACK_URL: http://localstack:4566
+    depends_on:
+      gateway: {condition: service_healthy}
+
+  admin:
+    <<: *app
+    restart: "no"
+    profiles: ["tools"]                                # the human's CLIs: connect, approve, audit
+    command: ["python", "scripts/approve.py", "list"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      AGENTGUARD_TOKEN_KEY: ${AGENTGUARD_TOKEN_KEY:?set AGENTGUARD_TOKEN_KEY in .env}
+    depends_on:
+      redis: {condition: service_healthy}
 
 volumes:
   redis-data:

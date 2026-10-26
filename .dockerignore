@@ -1,0 +1,10 @@
+# Never bake secrets or local state into an image.
+.env
+.venv/
+.git/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+evals/results.json
