@@ -22,9 +22,10 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1          # macOS/Linux: source .venv/bin/activate
 pip install -e ".[dev,agent,aws,ui]"
 
-pytest -q                             # 80 tests, ~90s; 3 live ones skip without docker compose
+pytest -q                             # 94 tests, ~2 min; 3 live ones skip without docker compose
 python demo/run_demo.py               # scripted incident, no Redis needed
 python demo/reconnect_demo.py         # dropped connections + gateway restart (part B needs Redis)
+python demo/github_oauth_demo.py      # per-user OAuth, scopes, refresh, no passthrough (self-contained)
 ```
 
 Run the LangGraph on-call agent. Put `GROQ_API_KEY` (free: https://console.groq.com/keys) and
@@ -52,6 +53,27 @@ python -m agent.run_agent --redis-url redis://localhost:6379/0 --on-approval exi
 python scripts/approve.py approve <id>            # or click Approve in the UI
 python -m agent.run_agent --resume --task-id <task> --redis-url redis://localhost:6379/0
 ```
+
+GitHub, per user, via OAuth 2.1 + PKCE (fake GitHub; settings in `.env.example`, keys generated with the
+command there):
+
+```powershell
+python -m servers.fake_github --port 9100          # or real GitHub: see "Real GitHub" below
+python -m servers.github_server --port 8770        # the GitHub MCP server = its own OAuth server
+python -m agentguard --transport http --github-url http://127.0.0.1:8770/mcp
+python -m agentguard.connect github --user alice --scopes "github:read github:write" --headless-login alice
+python -m agent.run_agent --gateway-url http://127.0.0.1:8765/mcp --user alice
+```
+
+### Real GitHub
+
+1. github.com → Settings → Developer settings → **GitHub Apps → New GitHub App**.
+   Callback URL `http://127.0.0.1:8770/github/callback`; tick **Expire user authorization tokens**
+   (that's what gives refresh tokens); untick Webhook *Active*; Repository permissions → **Issues: Read and write**.
+2. Generate a client secret. Put the Client ID and secret in `.env` as `GITHUB_CLIENT_ID` /
+   `GITHUB_CLIENT_SECRET`, and delete the `GITHUB_OAUTH_URL` / `GITHUB_API_URL` lines (they default to GitHub).
+3. **Install** the app on the repositories it may touch.
+4. `python -m agentguard.connect github --user <you>` (no `--headless-login`): your browser opens GitHub.
 
 Run the gateway for a real MCP client (needs Redis at `REDIS_URL`, default `redis://localhost:6379/0`):
 
@@ -83,6 +105,11 @@ Each call must carry `_meta`: `agentguard/task_id` (required) and
 | `docker-compose.yml` | Redis + LocalStack |
 | `skills/policies/` | `prod-safe`, `read-only-investigation` |
 | `scripts/` | `approve.py`, `audit.py` (human side; never MCP tools) |
+| `agentguard/oauth.py` | Gateway as per-user OAuth client: encrypted Redis token storage, absolute expiry, `OAuthDownstream` |
+| `agentguard/connect.py` | The human's one-time login: `python -m agentguard.connect github --user alice` |
+| `agentguard/crypto.py` | Fernet encryption for tokens we use; SHA-256 for tokens we only verify |
+| `servers/github_server.py` | GitHub MCP server: OAuth 2.1 authorization server federating to GitHub; tools act as the user |
+| `servers/fake_github.py` | Offline GitHub: OAuth (PKCE, expiring + rotating tokens) and a small issues API |
 | `ui/approvals.py` | Streamlit approvals console: pending approvals, approve/reject, audit trail, spend |
 | `agent/mcp_bridge.py` | MCP v2 tools → LLM tool specs; tool call → `tools/call` with `_meta` |
 | `agent/graph.py` | Hand-written LangGraph ReAct loop (agent ⇄ tools); pauses with `interrupt` for approvals |
@@ -137,6 +164,16 @@ Each call must carry `_meta`: `agentguard/task_id` (required) and
 - **Redis 8** (`redis:8.10.2-alpine`) because the LangGraph checkpointer needs RedisJSON + RediSearch, built in since Redis 8. RediSearch indexes only work in **database 0**, so checkpoints must live there; `run_agent` refuses another db with a clear message.
 - **The approvals UI is outside MCP and bound to 127.0.0.1.** It writes to Redis directly, so the agent has no path to it. It has no login yet and approver names are self-declared.
 - **Prompt lesson:** telling the model "destructive actions need approval" made it *skip* the deletion and claim approval was pending. The prompt now says: call the tool; AgentGuard pauses and a human decides. Enforcement lives outside the model; the prompt just mustn't fight it.
+- **Three tokens, each only used where it was issued; nothing passes through.** The agent sends no credentials. The gateway holds its own token per (server, user), issued *by* the GitHub MCP server *for* it (RFC 8707 audience). That server alone holds the user's GitHub token. A stolen gateway token is useless at GitHub; a GitHub token never reaches the gateway or the agent (tests assert both from GitHub's side).
+- **The GitHub MCP server is its own OAuth 2.1 authorization server and federates login to GitHub,** the MCP spec's third-party flow: our PKCE + one-time state toward GitHub (`GETDEL`; a forged callback gets 400), then our own authorization code to the gateway, bound to the GitHub login as `subject`.
+- **Two SDK settings that fail open:** an authorization server alone doesn't protect `/mcp` (only a `token_verifier` installs the bearer check), and without `validate_token_resource=True` tokens minted for *other* servers are accepted. Both are set explicitly; tests assert the 401s. `MCPServer.streamable_http_app()` doesn't forward auth settings, so auth goes to the lowlevel app directly.
+- **Tokens at rest are useless to a thief.** Tokens we must *use* are Fernet-encrypted with keys from the environment (gateway and GitHub server have different keys). Tokens we only *verify* are stored under their SHA-256 hash, and the record excludes the token itself. (The first version stored the full model, token included, under the hashed key. A test caught it.)
+- **Refresh tokens rotate, claimed atomically** (`DELETE` returns 1 for exactly one caller): a replayed or raced refresh token fails. GitHub refreshes take a per-user lock, because GitHub rotates too and the loser of a race would lose the user's tokens.
+- **Absolute expiry in storage.** OAuth's `expires_in` is relative, and the SDK sets no expiry at all for tokens loaded from storage, so a gateway (which always loads) never refreshed: at expiry it got a 401, the SDK tried a browser login, and the user was dropped. A small subclass restores the stored absolute expiry (refresh 60 s early).
+- **The gateway never starts a login.** Its redirect handler refuses, drops the dead record and returns `not_connected` with the exact command for the human. A 401 means the call never ran, so the idempotency key is released and the cost refunded, not recorded as "unknown".
+- **Least privilege scopes, chosen by the human.** `github:read` by default; `github:write` only if granted at connect time. The SDK requests whatever the server's 401 challenges (MCP scope selection) and overwrote the human's choice, so the gateway pins the chosen scopes. The server registers clients for all *valid* scopes; each grant is per authorization. **Approval is not permission:** a human approving a comment doesn't give a read-only token write access (demo step 3).
+- **A task acts for one human, bound once** (`SET NX` on first use; later calls naming another user are denied, check `owner`). Users who haven't connected a server don't see its tools.
+- **Reconnecting takes effect immediately.** `connect` bumps a per-user generation; the gateway restarts that user's live connection, which otherwise kept the old token (and scopes) in memory.
 - **Every decision and outcome is appended to a Redis Stream** `ag:audit:{task}`: append-only and ordered, with `XRANGE` for replay.
 
 ## Future work
@@ -145,6 +182,9 @@ Each call must carry `_meta`: `agentguard/task_id` (required) and
 - Stuck `in_progress` keys if the gateway crashes mid-call (today they expire after 24h).
 - Redact secrets from audited arguments.
 - **Argument-level policy rules**, e.g. `scale_service: require_approval if replicas > 6`, or only for named services. Seen in every real run: the agent scaled `api` 2 → 10–12 and the *healthy* `db` 1 → 4, and the policy allowed each step because it can only judge the tool name.
+- **Agent → gateway authentication.** The task owner is bound once, but the agent's connection to the gateway carries no credential yet; a malicious agent process could start a *new* task naming another user. Next step: protect the gateway's own `/mcp` with OAuth so each agent connection is a user.
+- **Consent screen** on the GitHub MCP server listing requested scopes (today the GitHub login is the only consent).
+- **401 with a still-valid refresh token** (server revoked only the access token): the SDK re-authorizes instead of refreshing, so the gateway reports `not_connected`. Normal expiry never hits this (absolute expiry + early refresh).
 - **Approvals UI auth** (SSO/OAuth) and verified approver identity; today it's localhost-only with a self-declared name.
 - **Gateway crash mid-call**: the detached call dies with the process and the key stays `in_progress` (24 h). Needs a lease (claim with a short TTL, renewed while running) and a reaper that turns expired leases into `unknown`, never into "absent", which would allow a re-run.
 - `MCPError(INTERNAL_ERROR)` from an HTTP 5xx is still treated as a known answer; a server that crashed mid-write could have acted. Could be classified `unknown` for writes.

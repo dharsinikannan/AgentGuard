@@ -7,6 +7,8 @@ colliding. Per-call identity comes from the request's `_meta`:
 
     agentguard/task_id          required; scopes budget, loops, approvals, audit
     agentguard/idempotency_key  optional; same key = same logical action
+    agentguard/user             the human the task acts for; selects whose OAuth
+                                token is used for user-scoped servers (e.g. github)
 
 All safety decisions are delegated to `Guard`. This module only translates between
 MCP and the guard, and handles transport failures.
@@ -31,6 +33,7 @@ log = logging.getLogger("agentguard.gateway")
 
 TASK_ID_META = "agentguard/task_id"
 IDEMPOTENCY_META = "agentguard/idempotency_key"
+USER_META = "agentguard/user"
 SEPARATOR = "__"
 
 
@@ -45,7 +48,7 @@ class Downstream(SupervisedClient):
 
 
 class Gateway:
-    def __init__(self, guard: Guard, downstreams: list[Downstream], *, read_retries: int = 2,
+    def __init__(self, guard: Guard, downstreams: list[Any], *, read_retries: int = 2,
                  execution_timeout: float = 120, attach_timeout: float = 15):
         self.guard = guard
         self.downstreams = {d.name: d for d in downstreams}
@@ -65,10 +68,13 @@ class Gateway:
 
     @asynccontextmanager
     async def running(self) -> AsyncIterator[Gateway]:
-        """Keep downstream connections alive for the duration of the block."""
+        """Keep downstream connections alive for the duration of the block.
+        Per-user connections (OAuth servers) are started on first use, in this group."""
         async with anyio.create_task_group() as tg:
+            self._tg = tg
             for d in self.downstreams.values():
-                await tg.start(d.run)
+                if not getattr(d, "user_scoped", False):
+                    await tg.start(d.run)
             try:
                 yield self
             finally:
@@ -76,10 +82,20 @@ class Gateway:
 
     # ------------------------------------------------------------ tools/list
 
+    async def _start(self, client: SupervisedClient) -> None:
+        await self._tg.start(client.run)
+
     async def _list_tools(self, ctx: Any, params: types.PaginatedRequestParams | None) -> types.ListToolsResult:
+        user = ((params.meta if params else None) or {}).get(USER_META)
         visible: list[types.Tool] = []
         for name, downstream in self.downstreams.items():
             try:
+                if getattr(downstream, "user_scoped", False):
+                    # Only list a user-scoped server's tools when this user has connected
+                    # it: the agent shouldn't plan around tools it can't use.
+                    if not user or not await downstream.is_connected(user):
+                        continue
+                    downstream = await downstream.client_for(user, self._start)
                 tools = await downstream.list_tools()
             except Exception:
                 # One dead server should not hide every other server's tools.
@@ -105,10 +121,22 @@ class Gateway:
         if not sep or downstream is None:
             return _error(f"unknown tool {params.name}", "invalid")
 
+        user = meta.get(USER_META)
         try:
-            call = CallContext(task_id, params.name, dict(params.arguments or {}), meta.get(IDEMPOTENCY_META))
+            call = CallContext(task_id, params.name, dict(params.arguments or {}), meta.get(IDEMPOTENCY_META),
+                               user=user)
         except ValueError as e:
             return _error(str(e), "invalid")
+
+        connection = downstream
+        if getattr(downstream, "user_scoped", False):
+            # Checked before the guard: a call that can't authenticate shouldn't
+            # cost budget or count toward loops.
+            if not user:
+                return _error(f"{server_name} acts as a human; the call has no _meta['{USER_META}']", "invalid")
+            if not await downstream.is_connected(user):
+                return _not_connected(user, server_name)
+            connection = await downstream.client_for(user, self._start)
 
         # Detached from the agent's connection. Over HTTP, a client that disconnects
         # cancels its request handler. Unshielded, that cancellation could land after
@@ -119,7 +147,7 @@ class Gateway:
         with anyio.CancelScope(shield=True):
             decision = await self.guard.check(call)
             if decision.verdict is Verdict.ALLOW:
-                return await self._execute(call, downstream, server_name, tool, decision)
+                return await self._execute(call, connection, server_name, tool, decision, downstream)
 
         if decision.in_flight:
             # Same key is executing right now (the agent reconnected and retried).
@@ -132,8 +160,8 @@ class Gateway:
             return _annotate(types.CallToolResult.model_validate(decision.cached_result), decision)
         return _blocked(decision)
 
-    async def _execute(self, call: CallContext, downstream: Downstream, server_name: str, tool: str,
-                       decision: Decision) -> types.CallToolResult:
+    async def _execute(self, call: CallContext, connection: SupervisedClient, server_name: str, tool: str,
+                       decision: Decision, downstream: Any) -> types.CallToolResult:
         """Run an allowed call and record its outcome. Called inside a shielded scope,
         so it has its own deadline: a hung downstream must not hold a key forever."""
         lost = _error(
@@ -148,7 +176,7 @@ class Gateway:
         with anyio.move_on_after(self.execution_timeout) as timer:
             for attempt in range(1, attempts + 1):
                 try:
-                    result = await downstream.call_tool(tool, call.args)
+                    result = await connection.call_tool(tool, call.args)
                     break
                 except MCPError as e:
                     # The server answered: the outcome is known (it failed).
@@ -157,6 +185,11 @@ class Gateway:
                 except Exception as e:
                     log.warning("downstream %s: %s failed (attempt %d/%d): %r",
                                 server_name, tool, attempt, attempts, e)
+                    if getattr(downstream, "user_scoped", False) and not await downstream.is_connected(call.user):
+                        # The server answered 401 and the refresh was refused, so the
+                        # tokens were dropped: the call was rejected, never executed.
+                        await self.guard.record_not_executed(call, "not_connected")
+                        return _not_connected(call.user, server_name)
                     if attempt == attempts:
                         await self.guard.record_unknown(call, repr(e))
                         return lost
@@ -168,6 +201,11 @@ class Gateway:
             call, result.model_dump(mode="json", by_alias=True, exclude_none=True), bool(result.is_error)
         )
         return _annotate(result, decision)
+
+
+def _not_connected(user: str, server: str) -> types.CallToolResult:
+    return _error(f"{user} has not connected {server} (or the authorization expired). A human must run: "
+                  f"python -m agentguard.connect {server} --user {user}", "not_connected")
 
 
 def _error(message: str, verdict: str) -> types.CallToolResult:

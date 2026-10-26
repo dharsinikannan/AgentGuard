@@ -27,12 +27,13 @@ log = logging.getLogger("agent.mcp_bridge")
 
 TASK_ID_META = "agentguard/task_id"
 IDEMPOTENCY_META = "agentguard/idempotency_key"
+USER_META = "agentguard/user"
 
 
-async def tool_specs(client: Any) -> list[dict[str, Any]]:
-    """The tools the gateway lists (already filtered by policy), in the format
-    every LangChain chat model's bind_tools() accepts."""
-    listing = await client.list_tools()
+async def tool_specs(client: Any, user: str | None = None) -> list[dict[str, Any]]:
+    """The tools the gateway lists (already filtered by policy, and for `user`: only
+    servers that user has connected), in the format bind_tools() accepts."""
+    listing = await client.list_tools(meta={USER_META: user} if user else None)
     tools = listing.tools if isinstance(listing, types.ListToolsResult) else listing
     return [
         {
@@ -61,7 +62,8 @@ def idempotency_key_for(tool_call_id: str) -> str:
     return f"tc-{safe}"
 
 
-async def call_mcp_tool(client: Any, tool_call: ToolCall, task_id: str, *, attempts: int = 3) -> ToolMessage:
+async def call_mcp_tool(client: Any, tool_call: ToolCall, task_id: str, *, attempts: int = 3,
+                        user: str | None = None) -> ToolMessage:
     """Run one tool call through AgentGuard, surviving a dropped connection.
 
     If the connection dies mid-call we resend the *same* call with the *same*
@@ -70,6 +72,8 @@ async def call_mcp_tool(client: Any, tool_call: ToolCall, task_id: str, *, attem
     it's still running, the retry waits for it. Never twice.
     """
     meta = {TASK_ID_META: task_id, IDEMPOTENCY_META: idempotency_key_for(tool_call["id"])}
+    if user:
+        meta[USER_META] = user
     for attempt in range(1, attempts + 1):
         try:
             result = await client.call_tool(tool_call["name"], tool_call["args"], meta=meta)

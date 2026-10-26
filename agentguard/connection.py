@@ -14,6 +14,7 @@ Callers in other tasks just get `ConnectionLost` and can retry.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 import anyio
@@ -31,9 +32,13 @@ class ConnectionLost(Exception):
 
 
 class SupervisedClient:
-    def __init__(self, name: str, target: Any, *, call_timeout: float = 30, connect_timeout: float = 10):
+    def __init__(self, name: str, target: Any, *, call_timeout: float = 30, connect_timeout: float = 10,
+                 target_factory: Callable[[], Any] | None = None):
         self.name = name
         self.target = target              # anything mcp.Client accepts: URL, StdioServerParameters, Server
+        # A transport object (e.g. an authenticated HTTP transport) is single-use, so
+        # reconnecting needs a fresh one each time: pass a factory instead.
+        self._target_factory = target_factory or (lambda: self.target)
         self.call_timeout = call_timeout
         self.connect_timeout = connect_timeout
         self._client: Client | None = None     # None while (re)connecting
@@ -44,7 +49,7 @@ class SupervisedClient:
         while True:
             self._broken = broken = anyio.Event()
             try:
-                async with Client(self.target, read_timeout_seconds=self.call_timeout) as client:
+                async with Client(self._target_factory(), read_timeout_seconds=self.call_timeout) as client:
                     self._client = client
                     await broken.wait()
             except Exception as e:
@@ -64,6 +69,11 @@ class SupervisedClient:
             raise ConnectionLost(f"{self.name}: not connected after {self.connect_timeout}s") from None
         return self._client
 
+    def restart(self) -> None:
+        """Drop the current connection; the supervisor opens a fresh one."""
+        if self._client is not None:
+            self._mark_broken(self._client)
+
     def _mark_broken(self, client: Client) -> None:
         # Only break the connection that actually failed, not a fresh replacement.
         # Unpublish it at once: closing it can take a while, and every caller in
@@ -72,13 +82,13 @@ class SupervisedClient:
             self._client = None
             self._broken.set()
 
-    async def list_tools(self) -> list[types.Tool]:
+    async def list_tools(self, *, meta: dict[str, Any] | None = None) -> list[types.Tool]:
         client = await self._get_client()
         tools: list[types.Tool] = []
         cursor = None
         try:
             while True:
-                page = await client.list_tools(cursor=cursor)
+                page = await client.list_tools(cursor=cursor, meta=meta)
                 tools.extend(page.tools)
                 cursor = page.next_cursor
                 if not cursor:

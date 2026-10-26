@@ -58,11 +58,12 @@ def build_agent(model: Any, client: Any, tool_specs: list[dict[str, Any]], check
 
     async def tools_node(state: MessagesState, config: RunnableConfig) -> dict:
         task_id = config["configurable"]["task_id"]
+        user = config["configurable"].get("user")   # whose connected accounts tools act as
         # Sequential on purpose: two writes from one model turn must not race,
         # and the audit trail stays in the order the model asked for them.
         results = []
         for tc in state["messages"][-1].tool_calls:
-            message = await call_mcp_tool(client, tc, task_id)
+            message = await call_mcp_tool(client, tc, task_id, user=user)
             if checkpointer is not None and _verdict(message) == "pending_approval":
                 # Pause here. On resume this node re-runs from the top, so the call
                 # above re-sends with the same key: approved, the gateway runs it;

@@ -7,6 +7,7 @@ dependencies = [
     "mcp>=2.3,<3",
     "redis>=5",
     "pyyaml>=6",
+    "cryptography>=42",   # tokens encrypted at rest (Fernet)
 ]
 
 [project.optional-dependencies]

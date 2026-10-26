@@ -11,7 +11,11 @@ import os
 
 PREFIXES = ("AGENTGUARD_", "AWS_")
 NAMES = ("LOCALSTACK_URL", "REDIS_URL")
+# Matched by the prefixes above but only for processes that need them: the token
+# encryption key goes to the gateway, never to the tool servers it spawns.
+SECRETS = ("AGENTGUARD_TOKEN_KEY",)
 
 
-def child_env() -> dict[str, str]:
-    return {k: v for k, v in os.environ.items() if k.startswith(PREFIXES) or k in NAMES}
+def child_env(*, secrets: tuple[str, ...] = ()) -> dict[str, str]:
+    return {k: v for k, v in os.environ.items()
+            if (k.startswith(PREFIXES) or k in NAMES) and (k not in SECRETS or k in secrets)}

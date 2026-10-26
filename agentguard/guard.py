@@ -3,7 +3,7 @@
 For every tool call the gateway asks `Guard.check()` for a Decision. Checks run in
 a fixed order, cheapest and most absolute first:
 
-    policy -> idempotency -> loop -> budget -> approval -> allow
+    owner -> policy -> idempotency -> loop -> budget -> approval -> allow
 
 Some checks have side effects (claiming an idempotency key, reserving budget).
 If a *later* check refuses the call, those side effects are rolled back, so a
@@ -22,6 +22,7 @@ Redis keys (all prefixed `ag:`):
     approval:rejected:{id}     human said no                            1h
     audit:{task}               STREAM of decisions and outcomes
     tasks                      SET of task ids seen (for scripts/audit.py)
+    task:{task}:owner          the human a task acts for, bound once      24h
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ AUDIT_MAXLEN = 10_000
 
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _IDEM_KEY_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,200}$")
+_USER_RE = re.compile(r"^[A-Za-z0-9_.@-]{1,64}$")
 
 
 class Verdict(str, Enum):
@@ -61,6 +63,7 @@ class CallContext:
     tool: str                       # namespaced, e.g. "cloud__delete_bucket"
     args: dict[str, Any]
     idempotency_key: str | None = None
+    user: str | None = None         # the human this task acts for (whose OAuth tokens to use)
 
     def __post_init__(self) -> None:
         # These strings become parts of Redis keys; a task id containing ":"
@@ -69,6 +72,8 @@ class CallContext:
             raise ValueError(f"invalid task_id {self.task_id!r}")
         if self.idempotency_key is not None and not _IDEM_KEY_RE.match(self.idempotency_key):
             raise ValueError(f"invalid idempotency_key {self.idempotency_key!r}")
+        if self.user is not None and not _USER_RE.match(self.user):
+            raise ValueError(f"invalid user {self.user!r}")
 
     @property
     def call_hash(self) -> str:
@@ -116,12 +121,24 @@ class Guard:
             ctx.task_id, "decision",
             tool=ctx.tool, args=json.dumps(ctx.args, sort_keys=True),
             verdict=decision.verdict.value, check=decision.check, reason=decision.reason,
-            idempotency_key=ctx.idempotency_key or "",
+            idempotency_key=ctx.idempotency_key or "", user=ctx.user or "",
         )
         return decision
 
     async def _evaluate(self, ctx: CallContext, undo: list[Undo]) -> Decision:
         r, p, h = self.redis, self.policy, ctx.call_hash
+
+        # 0. Owner. A task acts for one human, bound on first use (SET NX) and never
+        #    changed: a call claiming another user can't borrow that user's GitHub
+        #    access via an existing task.
+        if ctx.user is not None:
+            owner_key = f"ag:task:{ctx.task_id}:owner"
+            if not await r.set(owner_key, ctx.user, nx=True, ex=TASK_TTL_SECONDS):
+                owner = await r.get(owner_key)
+                owner = owner.decode() if isinstance(owner, bytes) else owner
+                if owner != ctx.user:
+                    return Decision(Verdict.DENY, "owner",
+                                    f"task {ctx.task_id} acts for {owner}, not {ctx.user}")
 
         # 1. Policy. Static, no Redis needed.
         rule = p.rule_for(ctx.tool)
@@ -250,6 +267,17 @@ class Guard:
             await self.redis.set(f"ag:idem:{ctx.task_id}:{ctx.idempotency_key}", record,
                                  ex=TASK_TTL_SECONDS)
         await self._audit(ctx.task_id, "outcome_unknown", tool=ctx.tool, error=error)
+
+    async def record_not_executed(self, ctx: CallContext, reason: str) -> None:
+        """The call was allowed but the server refused it before acting (e.g. the user's
+        authorization was gone). Nothing happened, so undo what check() reserved: release
+        the idempotency key (a retry after reconnecting must really run) and refund the cost."""
+        if ctx.idempotency_key:
+            await self.redis.delete(f"ag:idem:{ctx.task_id}:{ctx.idempotency_key}")
+        cost = self.policy.cost_paise(ctx.tool)
+        if cost:
+            await self.redis.decrby(f"ag:spend:{ctx.task_id}", cost)
+        await self._audit(ctx.task_id, "not_executed", tool=ctx.tool, reason=reason)
 
     async def wait_for_result(self, ctx: CallContext, timeout: float, poll: float = 0.1) -> Decision | None:
         """A retry arrived while the original call (same key) is still executing,

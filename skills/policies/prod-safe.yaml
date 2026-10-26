@@ -9,9 +9,12 @@ allow:
   - "cloud__list_*"
   - "cloud__scale_service"
   - "cloud__create_instance"
+  - "github__whoami"         # GitHub acts as the human who connected it
+  - "github__list_*"
 
 require_approval:
   - "cloud__delete_*"
+  - "github__comment_*"      # posts publicly under a human's name
 
 deny:
   - "cloud__*iam*"
@@ -32,5 +35,7 @@ loop:
 # Only reads may be retried after a dropped connection.
 safe_to_retry:
   - "obs__*"
+  - "github__whoami"
+  - "github__list_*"
   - "cloud__get_logs"
   - "cloud__list_*"

@@ -7,6 +7,8 @@ allow:
   - "obs__*"                 # logs + metrics: read-only
   - "cloud__get_logs"       # mock cloud only
   - "cloud__list_*"
+  - "github__whoami"
+  - "github__list_*"
 
 tool_costs:
   default: 0.5

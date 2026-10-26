@@ -59,6 +59,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", default=os.environ.get("GROQ_MODEL", DEFAULT_MODEL))
     p.add_argument("--max-steps", type=int, default=30, help="LangGraph recursion_limit")
     p.add_argument("--task-id", default=f"incident-{int(time.time())}")
+    p.add_argument("--user", default=getpass.getuser(),
+                   help="the human this task acts for: whose connected accounts (e.g. GitHub) tools use")
+    p.add_argument("--github-url", help="also proxy the OAuth-protected GitHub MCP server (needs --redis-url "
+                                        "or a gateway started with --github-url)")
     p.add_argument("--redis-url", help="spawn the real gateway (stdio) with this Redis, instead of in-process")
     p.add_argument("--gateway-url", help="connect to a running HTTP gateway, e.g. http://127.0.0.1:8765/mcp")
     p.add_argument("--cloud", choices=["mock", "aws"], default="mock",
@@ -92,9 +96,9 @@ async def open_gateway(stack: AsyncExitStack, args: argparse.Namespace):
         params = StdioServerParameters(
             command=sys.executable,
             args=["-m", "agentguard", "--policy", args.policy, "--redis-url", args.redis_url,
-                  "--cloud", args.cloud],
+                  "--cloud", args.cloud, *(["--github-url", args.github_url] if args.github_url else [])],
             cwd=str(ROOT),
-            env=child_env(),
+            env=child_env(secrets=("AGENTGUARD_TOKEN_KEY",)),   # the gateway decrypts user tokens
         )
         return await supervised(stack, params), await open_redis(stack, args.redis_url), False
 
@@ -221,7 +225,7 @@ async def main() -> None:
             await start_world(stack, args)
         client, redis, in_process = await open_gateway(stack, args)
         checkpointer, where = await open_checkpointer(stack, args, in_process)
-        specs = await tool_specs(client)
+        specs = await tool_specs(client, args.user)
         print("tools:", ", ".join(s["function"]["name"] for s in specs))
         print(f"checkpoints: {where} (thread {args.task_id})")
 
@@ -229,7 +233,7 @@ async def main() -> None:
         graph = build_agent(ChatGroq(model=args.model, temperature=0, max_retries=8), client, specs,
                             checkpointer=checkpointer)
         # thread_id: the checkpoint thread. One task = one thread, so --resume finds it.
-        config = {"configurable": {"thread_id": args.task_id, "task_id": args.task_id},
+        config = {"configurable": {"thread_id": args.task_id, "task_id": args.task_id, "user": args.user},
                   "recursion_limit": args.max_steps}
         state = await graph.aget_state(config)
         if args.resume and not state.values:

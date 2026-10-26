@@ -102,9 +102,12 @@ def test_child_env_passes_aws_settings_but_not_secrets(monkeypatch):
     monkeypatch.setenv("AGENTGUARD_AWS_TARGET", "localstack")
     monkeypatch.setenv("GROQ_API_KEY", "gsk_secret")
     monkeypatch.setenv("LOCALSTACK_AUTH_TOKEN", "ls-secret")
+    monkeypatch.setenv("AGENTGUARD_TOKEN_KEY", "fernet-key")
     env = child_env()
     assert env["AGENTGUARD_AWS_TARGET"] == "localstack"
     assert "GROQ_API_KEY" not in env and "LOCALSTACK_AUTH_TOKEN" not in env
+    assert "AGENTGUARD_TOKEN_KEY" not in env                      # tool servers never get it
+    assert child_env(secrets=("AGENTGUARD_TOKEN_KEY",))["AGENTGUARD_TOKEN_KEY"] == "fernet-key"  # the gateway does
 
 
 def _localstack_up() -> bool:

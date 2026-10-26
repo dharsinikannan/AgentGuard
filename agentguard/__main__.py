@@ -30,9 +30,11 @@ from mcp import StdioServerParameters
 from mcp.server.stdio import stdio_server
 from redis.asyncio import Redis
 
+from agentguard.crypto import TokenCipher
 from agentguard.env import child_env
 from agentguard.gateway import Downstream, Gateway
 from agentguard.guard import Guard
+from agentguard.oauth import OAuthDownstream
 from agentguard.policy import Policy
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -47,6 +49,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--cloud", choices=["mock", "aws"], default="mock",
                         help="mock: in-memory cloud; aws: boto3 servers (LocalStack by default)")
+    parser.add_argument("--github-url", help="GitHub MCP server (OAuth-protected), e.g. http://127.0.0.1:8770/mcp; "
+                                             "needs AGENTGUARD_TOKEN_KEY; users connect with agentguard.connect")
     parser.add_argument(
         "--server", action="append", metavar="NAME=COMMAND",
         help='downstream stdio server, e.g. cloud="python -m servers.cloud_server" (repeatable; overrides --cloud)',
@@ -87,7 +91,10 @@ async def main() -> None:
         sys.exit(f"agentguard: cannot reach Redis at {args.redis_url}: {e}")
 
     policy = Policy.from_yaml(args.policy)
-    gateway = Gateway(Guard(redis, policy), downstreams_from(args.server, args.cloud))
+    downstreams = downstreams_from(args.server, args.cloud)
+    if args.github_url:
+        downstreams.append(OAuthDownstream("github", args.github_url, redis, TokenCipher.from_env("AGENTGUARD_TOKEN_KEY")))
+    gateway = Gateway(Guard(redis, policy), downstreams)
     logging.info("policy=%s downstreams=%s", policy.name, list(gateway.downstreams))
 
     async with gateway.running():
