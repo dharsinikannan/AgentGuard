@@ -4,7 +4,8 @@ description: >
   Destructive actions need a human. Nothing can touch IAM.
 
 allow:
-  - "cloud__get_logs"
+  - "obs__*"                 # logs + metrics: read-only
+  - "cloud__get_logs"       # mock cloud only
   - "cloud__list_*"
   - "cloud__scale_service"
   - "cloud__create_instance"
@@ -30,5 +31,6 @@ loop:
 
 # Only reads may be retried after a dropped connection.
 safe_to_retry:
+  - "obs__*"
   - "cloud__get_logs"
   - "cloud__list_*"

@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+import anyio
 from redis.asyncio import Redis
 
 from agentguard.policy import Policy
@@ -81,6 +82,7 @@ class Decision:
     reason: str                             # human/LLM-readable
     cached_result: dict[str, Any] | None = None
     approval_id: str | None = None
+    in_flight: bool = False                 # same key is executing right now; caller may wait
 
 
 def call_hash(tool: str, args: dict[str, Any]) -> str:
@@ -199,7 +201,8 @@ class Guard:
                             cached_result=record["result"])
         if status == "in_progress":
             return Decision(Verdict.DENY, "idempotency",
-                            "an identical call with this idempotency key is still in flight")
+                            "an identical call with this idempotency key is still in flight",
+                            in_flight=True)
         # status == "unknown"
         return Decision(
             Verdict.DENY, "idempotency",
@@ -247,6 +250,28 @@ class Guard:
             await self.redis.set(f"ag:idem:{ctx.task_id}:{ctx.idempotency_key}", record,
                                  ex=TASK_TTL_SECONDS)
         await self._audit(ctx.task_id, "outcome_unknown", tool=ctx.tool, error=error)
+
+    async def wait_for_result(self, ctx: CallContext, timeout: float, poll: float = 0.1) -> Decision | None:
+        """A retry arrived while the original call (same key) is still executing,
+        typically because the agent's connection dropped and it reconnected.
+        Wait for the original to finish and hand back its outcome, instead of
+        refusing or running it twice. None if it is still running after `timeout`.
+
+        Polling, not pub/sub: one GET per 100 ms for a rare event is cheap, and
+        there is no subscription to leak if the waiter disconnects.
+        """
+        if not ctx.idempotency_key:
+            return None
+        key = f"ag:idem:{ctx.task_id}:{ctx.idempotency_key}"
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            await anyio.sleep(poll)
+            decision = await self._existing_idempotency_record(key, ctx.call_hash)
+            if decision is not None and not decision.in_flight:
+                await self._audit(ctx.task_id, "attached", tool=ctx.tool, verdict=decision.verdict.value,
+                                  idempotency_key=ctx.idempotency_key)
+                return decision
+        return None
 
     # ------------------------------------------------------------ helpers
 

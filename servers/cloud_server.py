@@ -11,6 +11,7 @@ from __future__ import annotations
 import itertools
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 mcp = MCPServer("cloud", instructions="Mock cloud provider for the AgentGuard demo.")
 
@@ -66,9 +67,9 @@ def scale_service(service: str, replicas: int) -> str:
     """Set the replica count of a service. More replicas lower latency."""
     svc = STATE["services"].get(service)
     if svc is None:
-        raise ValueError(f"no such service: {service}")
+        raise ToolError(f"no such service: {service}")
     if not 1 <= replicas <= 20:
-        raise ValueError("replicas must be between 1 and 20")
+        raise ToolError("replicas must be between 1 and 20")
     old = svc["replicas"]
     svc["replicas"] = replicas
     svc["p99_ms"] = max(80, svc["p99_ms"] * old // replicas)
@@ -87,7 +88,7 @@ def create_instance(name: str, instance_type: str = "t3.medium") -> str:
 def delete_bucket(bucket: str) -> str:
     """Permanently delete a storage bucket and everything in it."""
     if bucket not in STATE["buckets"]:
-        raise ValueError(f"no such bucket: {bucket}")
+        raise ToolError(f"no such bucket: {bucket}")
     del STATE["buckets"][bucket]
     return f"deleted bucket {bucket}"
 

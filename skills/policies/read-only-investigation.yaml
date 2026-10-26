@@ -4,7 +4,8 @@ description: >
   listed, so the model never plans around them.
 
 allow:
-  - "cloud__get_logs"
+  - "obs__*"                 # logs + metrics: read-only
+  - "cloud__get_logs"       # mock cloud only
   - "cloud__list_*"
 
 tool_costs:
@@ -18,5 +19,6 @@ loop:
   window_seconds: 600
 
 safe_to_retry:
+  - "obs__*"
   - "cloud__get_logs"
   - "cloud__list_*"

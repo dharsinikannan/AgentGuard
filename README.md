@@ -9,8 +9,9 @@ an agent and its MCP tools and stops:
 - **duplicate actions after a dropped connection**: idempotency keys, no blind retries of writes
 
 ```
-agent ──MCP──► AgentGuard ──MCP──► cloud server (· github · logs, later)
-                   │
+agent ──MCP──► AgentGuard ──MCP──► cloud__*  (EC2, S3)          ─┐
+                   │       └─MCP──► obs__*    (CloudWatch logs,   ├─ boto3 → LocalStack (or real AWS)
+                   │                           metrics)          ─┘
                  Redis   budgets · loop counters · idempotency · approvals · audit stream
 ```
 
@@ -19,24 +20,34 @@ agent ──MCP──► AgentGuard ──MCP──► cloud server (· github �
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1          # macOS/Linux: source .venv/bin/activate
-pip install -e ".[dev,agent]"
+pip install -e ".[dev,agent,aws]"
 
-pytest -q                             # 52 tests, ~2s, no Redis or API key needed
+pytest -q                             # 72 tests, ~40s, no Docker/Redis/API key (AWS via moto)
 python demo/run_demo.py               # scripted incident, no Redis needed
+python demo/reconnect_demo.py         # dropped connections + gateway restart (part B needs Redis)
 ```
 
-Run the LangGraph on-call agent (free Groq key from https://console.groq.com/keys):
+Run the LangGraph on-call agent. Put `GROQ_API_KEY` (free: https://console.groq.com/keys) and
+`LOCALSTACK_AUTH_TOKEN` (free Hobby plan: https://app.localstack.cloud) in `.env` (see `.env.example`).
 
 ```powershell
-$env:GROQ_API_KEY = "gsk_..."
-python -m agent.run_agent                                   # in-process gateway + fakeredis
-python -m agent.run_agent --redis-url redis://localhost:6379  # real gateway + Redis; approve.py works
+python -m agent.run_agent                         # mock cloud, in-process gateway + fakeredis
+
+docker compose up -d                              # Redis + LocalStack
+python -m agent.run_agent --cloud aws --redis-url redis://localhost:6379/0
+                                                  # full stack: real gateway, Redis, AWS APIs on LocalStack,
+                                                  # world seeded + simulated traffic; approve.py works
+python -m servers.world seed                      # reset LocalStack to the incident start
+
+python -m agentguard --transport http --port 8765 # HTTP gateway (Streamable HTTP at /mcp)
+python -m agent.run_agent --gateway-url http://127.0.0.1:8765/mcp
 ```
 
 Run the gateway for a real MCP client (needs Redis at `REDIS_URL`, default `redis://localhost:6379/0`):
 
 ```powershell
-python -m agentguard --policy skills/policies/prod-safe.yaml
+python -m agentguard --policy skills/policies/prod-safe.yaml            # mock cloud
+python -m agentguard --policy skills/policies/prod-safe.yaml --cloud aws  # boto3 servers
 python scripts/approve.py list
 python scripts/approve.py approve <approval_id>
 python scripts/audit.py <task_id>
@@ -52,14 +63,21 @@ Each call must carry `_meta`: `agentguard/task_id` (required) and
 | `agentguard/policy.py` | YAML policy packs: allow / deny / require_approval / costs / loop limits / safe_to_retry |
 | `agentguard/guard.py` | Decision engine: policy → idempotency → loop → budget → approval → allow. No MCP imports. |
 | `agentguard/gateway.py` | MCP proxy: namespaced tools `<server>__<tool>`, filters `tools/list`, enforces decisions |
+| `agentguard/connection.py` | `SupervisedClient`: self-reconnecting MCP client (gateway → servers, agent → gateway) |
 | `agentguard/chaos.py` | Fault injection (response lost after the server acted) |
-| `servers/cloud_server.py` | Mock cloud MCP server |
+| `servers/cloud_server.py` | Mock cloud MCP server (fast tests, scripted demo) |
+| `servers/aws_cloud_server.py` | Cloud MCP server on EC2 + S3 (boto3) |
+| `servers/observability_server.py` | Read-only logs + metrics MCP server on CloudWatch |
+| `servers/world.py` | Seeds the incident; simulates traffic (p99 = load ÷ live instances) |
+| `servers/aws.py` | Target selection (LocalStack / AWS), error mapping, shared helpers |
+| `docker-compose.yml` | Redis + LocalStack |
 | `skills/policies/` | `prod-safe`, `read-only-investigation` |
 | `scripts/` | `approve.py`, `audit.py` (human side; never MCP tools) |
 | `agent/mcp_bridge.py` | MCP v2 tools → LLM tool specs; tool call → `tools/call` with `_meta` |
 | `agent/graph.py` | Hand-written LangGraph ReAct loop (agent ⇄ tools) |
 | `agent/run_agent.py` | CLI: Groq model → AgentGuard → cloud server |
 | `demo/run_demo.py` | Every protection, end to end (scripted) |
+| `demo/reconnect_demo.py` | Dropped connection mid-launch; gateway killed and restarted mid-task |
 
 ## Design decisions
 
@@ -83,6 +101,23 @@ Each call must carry `_meta`: `agentguard/task_id` (required) and
 - **Own tools node instead of the prebuilt `ToolNode`.** Each call needs `_meta`. Tool calls in one model turn run sequentially, so two writes never race and the audit order matches the model's order.
 - **Blocked calls go back to the model as `ToolMessage(status="error")` with the reason.** The model can adapt instead of retrying blindly. `recursion_limit` is a second, agent-side step cap; the gateway is the one the agent can't bypass.
 - **The model is injected into the graph.** Tests drive the real graph, MCP and gateway with a scripted model: deterministic, no API key.
+- **AWS servers are plain boto3; the target is an explicit setting** (`AGENTGUARD_AWS_TARGET=localstack|aws`, default LocalStack with dummy credentials). A dev laptop can't reach real AWS by accident, and `servers.world seed` refuses real AWS without `--allow-real-aws`, because it deletes resources.
+- **A "service" is EC2 instances tagged `Service=<name>`.** `scale_service` launches/terminates tagged instances, which is what an Auto Scaling group does underneath (Auto Scaling isn't in LocalStack's free plan). Every resource we create is tagged `Project=agentguard`; teardown touches only those.
+- **Telemetry is a separate, read-only MCP server** (`obs__*`), as in real companies: reading telemetry is safe and retryable, changing infrastructure isn't. The policy marks `obs__*` as `safe_to_retry`.
+- **A simulator plays production traffic** (`servers/world.py`): the cloud server *acts*, the observability server *reads*, the world *reacts*. Scaling really lowers the latency the agent observes.
+- **Gateway idempotency is needed even on AWS.** LocalStack ignores EC2 `ClientToken` (the same token launched two instances), and not every API has one. A test proves the gateway still turns a retried launch into a replay.
+- **AWS errors reach the model as `ToolError`.** MCPServer replaces any other exception's message with "Error executing tool", so `BucketNotEmpty` would be invisible to the agent.
+- **Metrics are stored at 1-second resolution and read per second.** With 1-minute buckets the pre-fix maximum lingers right after a fix, and the agent concluded scaling hadn't helped. The tool description also warns that metrics lag.
+- **Re-seeding writes a `history_reset` marker metric.** CloudWatch can't delete datapoints, so a previous run's latency appeared as "recent"; points older than the marker are hidden.
+- **Logs: read the whole window, return the tail, collapse repeats.** `filter_log_events` returns oldest first, so `limit=N` gave stale lines. Identical consecutive lines become `line (xN)`: same information, a fraction of the tokens (the free Groq tier is 8k tokens/min).
+- **Simple log filters are re-applied locally.** LocalStack ignores `filterPattern` entirely (moto honours it, so tests didn't catch it at first). Lesson: verify emulator fidelity per feature.
+- **Child processes get an explicit env allowlist** (`AGENTGUARD_*`, `AWS_*`, `LOCALSTACK_URL`, `REDIS_URL`). The MCP stdio client passes almost nothing by default, and passing everything would hand every server the Groq key and LocalStack token.
+- **HTTP is stateless (MCP 2026-07-28); no session resumption was built.** The protocol has no session to resume: one request in, one response out. Legacy `EventStore` replay only helps old-protocol clients and needs sticky routing. All state AgentGuard needs is already in Redis, keyed by task and idempotency key, so any gateway process can serve any request, and "reconnect without losing place" happens per action. The demo kills the gateway mid-task: budget and loop counts carry on.
+- **Allowed calls run detached from the agent's connection.** Over HTTP a client disconnect cancels the request handler. Unshielded, that left the idempotency key `in_progress` for 24 h and the outcome unrecorded, and every retry was refused. Decide + execute + record now run in a shielded scope with their own deadline (`execution_timeout`, 120 s; on timeout the outcome is `unknown`).
+- **A retry during the original attaches to it.** Instead of "still in flight", the retry waits (up to 15 s, by polling Redis) and returns the original's result as a replay. Waiting is *not* shielded: if that caller leaves too, nobody needs the answer.
+- **The agent resends a lost call with the same key, even writes.** It's safe only because the gateway dedupes by key. The agent's timeout (180 s) is longer than the gateway's (120 + 15 s), so the gateway records `unknown`; the agent never just hangs up first.
+- **A lost connection is never a known failure.** The SDK reports a dead connection as `MCPError(CONNECTION_CLOSED)`, synthesized locally. Treating it as "the server answered" recorded writes that may have run as failed, and the agent would redo them. A server could use -32000 itself; we still treat it as lost, erring toward a human check, never a duplicate.
+- **`SupervisedClient` unpublishes a dead connection at once** and the supervisor reconnects. An `mcp.Client` is finished for good after its connection dies, and closing it takes time; callers in that window were handed the same dead client. Waiters poll for a live client (50 ms) instead of an Event that could be swapped under them.
 - **Every decision and outcome is appended to a Redis Stream** `ag:audit:{task}`: append-only and ordered, with `XRANGE` for replay.
 
 ## Future work
@@ -90,3 +125,8 @@ Each call must carry `_meta`: `agentguard/task_id` (required) and
 - Budget refunds when a write fails definitively (today a reserved cost is kept).
 - Stuck `in_progress` keys if the gateway crashes mid-call (today they expire after 24h).
 - Redact secrets from audited arguments.
+- **Argument-level policy rules**, e.g. `scale_service: require_approval if replicas > 6`, or only for named services. Seen in every real run: the agent scaled `api` 2 → 10–12 and the *healthy* `db` 1 → 4, and the policy allowed each step because it can only judge the tool name.
+- **Gateway crash mid-call**: the detached call dies with the process and the key stays `in_progress` (24 h). Needs a lease (claim with a short TTL, renewed while running) and a reaper that turns expired leases into `unknown`, never into "absent", which would allow a re-run.
+- `MCPError(INTERNAL_ERROR)` from an HTTP 5xx is still treated as a known answer; a server that crashed mid-write could have acted. Could be classified `unknown` for writes.
+- Real Auto Scaling groups instead of tagged instances (needs a paid LocalStack plan or real AWS).
+- More clouds: AgentGuard is cloud-agnostic; Azure/GCP need only another MCP server and `azure__*` / `gcp__*` policy rules.

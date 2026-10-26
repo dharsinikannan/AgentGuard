@@ -16,7 +16,6 @@ from typing import Any
 from langchain_core.messages import SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, MessagesState, StateGraph
-from mcp import Client
 
 from agent.mcp_bridge import call_mcp_tool
 
@@ -33,8 +32,9 @@ How to work:
   short summary: cause, actions taken, anything waiting for a human."""
 
 
-def build_agent(model: Any, client: Client, tool_specs: list[dict[str, Any]]):
-    """`model` is any LangChain chat model (anything with bind_tools + ainvoke)."""
+def build_agent(model: Any, client: Any, tool_specs: list[dict[str, Any]]):
+    """`model`: any LangChain chat model (bind_tools + ainvoke). `client`: a SupervisedClient
+    or mcp.Client connected to AgentGuard."""
     llm = model.bind_tools(tool_specs)
 
     async def agent_node(state: MessagesState) -> dict:

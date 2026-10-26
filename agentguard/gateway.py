@@ -21,9 +21,10 @@ from typing import Any
 
 import anyio
 import mcp_types as types
-from mcp import Client, MCPError
+from mcp import MCPError
 from mcp.server.lowlevel import Server
 
+from agentguard.connection import SupervisedClient
 from agentguard.guard import CallContext, Decision, Guard, Verdict
 
 log = logging.getLogger("agentguard.gateway")
@@ -33,81 +34,24 @@ IDEMPOTENCY_META = "agentguard/idempotency_key"
 SEPARATOR = "__"
 
 
-class Downstream:
-    """One downstream MCP server, behind a single long-lived connection.
+class Downstream(SupervisedClient):
+    """One downstream MCP server behind a supervised, self-reconnecting connection.
+    Its name becomes the tool prefix (`cloud` -> `cloud__delete_bucket`)."""
 
-    `run()` is a supervisor task that owns the `Client`. A failed call marks the
-    connection broken; the supervisor then closes it and reconnects. The `Client`
-    is entered and exited in the same task, which anyio requires.
-    """
-
-    def __init__(self, name: str, target: Any, *, call_timeout: float = 30, connect_timeout: float = 10):
+    def __init__(self, name: str, target: Any, **kwargs: Any):
         if SEPARATOR in name:
             raise ValueError(f"server name may not contain {SEPARATOR!r}: {name}")
-        self.name = name
-        self.target = target              # anything mcp.Client accepts
-        self.call_timeout = call_timeout
-        self.connect_timeout = connect_timeout
-        self._client: Client | None = None
-        self._ready = anyio.Event()
-        self._broken = anyio.Event()
-
-    async def run(self, *, task_status: anyio.abc.TaskStatus[None] = anyio.TASK_STATUS_IGNORED) -> None:
-        task_status.started()
-        while True:
-            try:
-                async with Client(self.target, read_timeout_seconds=self.call_timeout) as client:
-                    self._client = client
-                    self._ready.set()
-                    await self._broken.wait()
-            except Exception:
-                log.exception("downstream %s: connection failed", self.name)
-                await anyio.sleep(1)
-            finally:
-                self._client = None
-                self._ready = anyio.Event()
-                self._broken = anyio.Event()
-
-    async def _get_client(self) -> Client:
-        with anyio.fail_after(self.connect_timeout):
-            while self._client is None:
-                await self._ready.wait()
-        return self._client
-
-    def _mark_broken(self, client: Client) -> None:
-        # Only break the connection that actually failed, not a fresh replacement.
-        if client is self._client:
-            self._broken.set()
-
-    async def list_tools(self) -> list[types.Tool]:
-        client = await self._get_client()
-        tools: list[types.Tool] = []
-        cursor = None
-        while True:
-            page = await client.list_tools(cursor=cursor)
-            tools.extend(page.tools)
-            cursor = page.next_cursor
-            if not cursor:
-                return tools
-
-    async def call_tool(self, tool: str, args: dict[str, Any]) -> types.CallToolResult:
-        """Raises MCPError if the server answered with an error; any other
-        exception means we don't know whether the server ran the tool."""
-        client = await self._get_client()
-        try:
-            return await client.call_tool(tool, args)
-        except MCPError:
-            raise
-        except Exception:
-            self._mark_broken(client)
-            raise
+        super().__init__(name, target, **kwargs)
 
 
 class Gateway:
-    def __init__(self, guard: Guard, downstreams: list[Downstream], *, read_retries: int = 2):
+    def __init__(self, guard: Guard, downstreams: list[Downstream], *, read_retries: int = 2,
+                 execution_timeout: float = 120, attach_timeout: float = 15):
         self.guard = guard
         self.downstreams = {d.name: d for d in downstreams}
         self.read_retries = read_retries
+        self.execution_timeout = execution_timeout   # hard cap per call, even when detached
+        self.attach_timeout = attach_timeout         # how long a retry waits for an in-flight original
         self.server = Server(
             "agentguard",
             version="0.1.0",
@@ -166,33 +110,59 @@ class Gateway:
         except ValueError as e:
             return _error(str(e), "invalid")
 
-        decision = await self.guard.check(call)
+        # Detached from the agent's connection. Over HTTP, a client that disconnects
+        # cancels its request handler. Unshielded, that cancellation could land after
+        # the idempotency claim or mid-downstream-call, leaving the key "in_progress"
+        # forever and the outcome unrecorded. So decide + execute + record finish
+        # even if nobody is listening; a reconnecting agent then gets the result
+        # by retrying with the same idempotency key.
+        with anyio.CancelScope(shield=True):
+            decision = await self.guard.check(call)
+            if decision.verdict is Verdict.ALLOW:
+                return await self._execute(call, downstream, server_name, tool, decision)
+
+        if decision.in_flight:
+            # Same key is executing right now (the agent reconnected and retried).
+            # Wait for it instead of refusing. Not shielded: if this caller goes
+            # away too, there's no one to wait for.
+            attached = await self.guard.wait_for_result(call, self.attach_timeout)
+            if attached is not None:
+                decision = attached
         if decision.verdict is Verdict.REPLAY:
             return _annotate(types.CallToolResult.model_validate(decision.cached_result), decision)
-        if decision.verdict is not Verdict.ALLOW:
-            return _blocked(decision)
+        return _blocked(decision)
 
+    async def _execute(self, call: CallContext, downstream: Downstream, server_name: str, tool: str,
+                       decision: Decision) -> types.CallToolResult:
+        """Run an allowed call and record its outcome. Called inside a shielded scope,
+        so it has its own deadline: a hung downstream must not hold a key forever."""
+        lost = _error(
+            f"connection to {server_name} was lost during {call.tool}; the action may or "
+            "may not have happened. Check the current state before trying again.",
+            "outcome_unknown",
+        )
         # Reads may be retried on a fresh connection. Writes may not: if the
         # connection dropped after the server acted, a retry does it twice.
-        attempts = 1 + (self.read_retries if self.guard.policy.is_safe_to_retry(params.name) else 0)
-        for attempt in range(1, attempts + 1):
-            try:
-                result = await downstream.call_tool(tool, call.args)
-                break
-            except MCPError as e:
-                # The server answered: the outcome is known (it failed).
-                result = _error(f"{server_name} returned an error: {e}", "downstream_error")
-                break
-            except Exception as e:
-                log.warning("downstream %s: %s failed (attempt %d/%d): %r",
-                            server_name, tool, attempt, attempts, e)
-                if attempt == attempts:
-                    await self.guard.record_unknown(call, repr(e))
-                    return _error(
-                        f"connection to {server_name} was lost during {params.name}; the action may or "
-                        "may not have happened. Check the current state before trying again.",
-                        "outcome_unknown",
-                    )
+        attempts = 1 + (self.read_retries if self.guard.policy.is_safe_to_retry(call.tool) else 0)
+        result: types.CallToolResult | None = None
+        with anyio.move_on_after(self.execution_timeout) as timer:
+            for attempt in range(1, attempts + 1):
+                try:
+                    result = await downstream.call_tool(tool, call.args)
+                    break
+                except MCPError as e:
+                    # The server answered: the outcome is known (it failed).
+                    result = _error(f"{server_name} returned an error: {e}", "downstream_error")
+                    break
+                except Exception as e:
+                    log.warning("downstream %s: %s failed (attempt %d/%d): %r",
+                                server_name, tool, attempt, attempts, e)
+                    if attempt == attempts:
+                        await self.guard.record_unknown(call, repr(e))
+                        return lost
+        if timer.cancelled_caught or result is None:
+            await self.guard.record_unknown(call, f"no answer within {self.execution_timeout}s")
+            return lost
 
         await self.guard.record_result(
             call, result.model_dump(mode="json", by_alias=True, exclude_none=True), bool(result.is_error)

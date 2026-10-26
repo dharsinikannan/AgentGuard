@@ -1,12 +1,18 @@
-"""Run AgentGuard as a stdio MCP server backed by real Redis.
+"""Run AgentGuard as an MCP server backed by real Redis.
 
-    python -m agentguard --policy skills/policies/prod-safe.yaml
+    python -m agentguard                                  # stdio: a client launches us
+    python -m agentguard --transport http --port 8765     # Streamable HTTP at /mcp
 
-Point any MCP client (Claude Desktop, LangGraph, `mcp` CLI) at this command
-instead of at the cloud server directly.
+Point any MCP client (Claude Desktop, LangGraph, `mcp` CLI) at this instead of at
+the cloud server directly.
 
-stdout is the MCP channel, so all logging goes to stderr. One stray print()
-to stdout corrupts the JSON-RPC stream.
+HTTP is stateless (protocol 2026-07-28: one request in, one response out, no
+session). Everything AgentGuard remembers lives in Redis, keyed by task id and
+idempotency key, so an agent can reconnect, even to another gateway process,
+without losing its place.
+
+In stdio mode stdout is the MCP channel, so all logging goes to stderr. One stray
+print() to stdout corrupts the JSON-RPC stream.
 """
 
 from __future__ import annotations
@@ -19,10 +25,12 @@ import sys
 from pathlib import Path
 
 import anyio
+import uvicorn
 from mcp import StdioServerParameters
 from mcp.server.stdio import stdio_server
 from redis.asyncio import Redis
 
+from agentguard.env import child_env
 from agentguard.gateway import Downstream, Gateway
 from agentguard.guard import Guard
 from agentguard.policy import Policy
@@ -34,22 +42,36 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="agentguard")
     parser.add_argument("--policy", default=str(ROOT / "skills/policies/prod-safe.yaml"))
     parser.add_argument("--redis-url", default=os.environ.get("REDIS_URL", "redis://localhost:6379/0"))
+    parser.add_argument("--transport", choices=["stdio", "http"], default="stdio")
+    parser.add_argument("--host", default="127.0.0.1", help="http: bind address (keep 127.0.0.1 unless behind auth)")
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--cloud", choices=["mock", "aws"], default="mock",
+                        help="mock: in-memory cloud; aws: boto3 servers (LocalStack by default)")
     parser.add_argument(
         "--server", action="append", metavar="NAME=COMMAND",
-        help='downstream stdio server, e.g. cloud="python -m servers.cloud_server" (repeatable)',
+        help='downstream stdio server, e.g. cloud="python -m servers.cloud_server" (repeatable; overrides --cloud)',
     )
     return parser.parse_args()
 
 
-def downstreams_from(specs: list[str] | None) -> list[Downstream]:
+CLOUDS = {
+    "mock": {"cloud": "servers.cloud_server"},
+    "aws": {"cloud": "servers.aws_cloud_server", "obs": "servers.observability_server"},
+}
+
+
+def downstreams_from(specs: list[str] | None, cloud: str = "mock") -> list[Downstream]:
+    env = child_env()
     if not specs:
-        default = StdioServerParameters(command=sys.executable, args=["-m", "servers.cloud_server"], cwd=str(ROOT))
-        return [Downstream("cloud", default)]
+        return [
+            Downstream(name, StdioServerParameters(command=sys.executable, args=["-m", module], cwd=str(ROOT), env=env))
+            for name, module in CLOUDS[cloud].items()
+        ]
     result = []
     for spec in specs:
         name, _, command = spec.partition("=")
         argv = shlex.split(command, posix=os.name != "nt")
-        result.append(Downstream(name, StdioServerParameters(command=argv[0], args=argv[1:], cwd=str(ROOT))))
+        result.append(Downstream(name, StdioServerParameters(command=argv[0], args=argv[1:], cwd=str(ROOT), env=env)))
     return result
 
 
@@ -65,11 +87,19 @@ async def main() -> None:
         sys.exit(f"agentguard: cannot reach Redis at {args.redis_url}: {e}")
 
     policy = Policy.from_yaml(args.policy)
-    gateway = Gateway(Guard(redis, policy), downstreams_from(args.server))
+    gateway = Gateway(Guard(redis, policy), downstreams_from(args.server, args.cloud))
     logging.info("policy=%s downstreams=%s", policy.name, list(gateway.downstreams))
 
-    async with gateway.running(), stdio_server() as (read, write):
-        await gateway.server.run(read, write, gateway.server.create_initialization_options())
+    async with gateway.running():
+        if args.transport == "stdio":
+            async with stdio_server() as (read, write):
+                await gateway.server.run(read, write, gateway.server.create_initialization_options())
+        else:
+            # stateless_http: older-protocol clients get no session either, so no
+            # client is ever pinned to one gateway process.
+            app = gateway.server.streamable_http_app(stateless_http=True, host=args.host)
+            logging.info("listening on http://%s:%d/mcp", args.host, args.port)
+            await uvicorn.Server(uvicorn.Config(app, host=args.host, port=args.port, log_level="warning")).serve()
 
 
 if __name__ == "__main__":
