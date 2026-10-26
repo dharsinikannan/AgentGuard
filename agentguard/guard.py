@@ -169,10 +169,11 @@ class Guard:
                     return Decision(Verdict.DENY, "owner",
                                     f"task {ctx.task_id} acts for {owner}, not {ctx.user}")
 
-        # 1. Policy. Static, no Redis needed.
-        rule = p.rule_for(ctx.tool)
+        # 1. Policy: the tool's rule, tightened by argument rules (replicas > 6, ...).
+        rule, why = p.rule_for_call(ctx.tool, ctx.args)
         if rule == "deny":
-            return Decision(Verdict.DENY, "policy", f"policy '{p.name}' does not permit {ctx.tool}")
+            return Decision(Verdict.DENY, "policy", f"policy '{p.name}' does not permit {ctx.tool}"
+                                                    + (f" with these arguments: {why}" if why else ""))
 
         # 2. Idempotency. Atomic claim with SET NX: of N concurrent requests with
         #    the same key, exactly one wins. check-then-set would let two through.
@@ -224,8 +225,10 @@ class Guard:
         cost = p.cost_paise(ctx.tool)
         if cost:
             spend_key = f"ag:spend:{ctx.task_id}"
-            spent = await r.incrby(spend_key, cost)
-            await r.expire(spend_key, TASK_TTL_SECONDS, nx=True)
+            async with r.pipeline(transaction=True) as pipe:   # one round-trip, still atomic
+                pipe.incrby(spend_key, cost)
+                pipe.expire(spend_key, TASK_TTL_SECONDS, nx=True)
+                spent, _ = await pipe.execute()
             undo.append(lambda: r.decrby(spend_key, cost))
             if spent > p.budget_paise:
                 return Decision(
@@ -236,7 +239,7 @@ class Guard:
 
         # 5. Human approval, bound to this exact task + tool + args.
         if rule == "require_approval":
-            decision = await self._approval(ctx)
+            decision = await self._approval(ctx, why)
             if decision:
                 return decision
 
@@ -269,7 +272,7 @@ class Guard:
             "unknown. Do not retry blindly: check the current state (e.g. list resources) first.",
         )
 
-    async def _approval(self, ctx: CallContext) -> Decision | None:
+    async def _approval(self, ctx: CallContext, why: str | None = None) -> Decision | None:
         r = self.redis
         aid = approval_id(ctx.task_id, ctx.call_hash)
 
@@ -283,11 +286,12 @@ class Guard:
 
         request = json.dumps({
             "task_id": ctx.task_id, "tool": ctx.tool, "args": ctx.args, "requested_at": time.time(),
+            "reason": why or "",
         })
         await r.hsetnx("ag:approvals:pending", aid, request)
         return Decision(
             Verdict.PENDING_APPROVAL, "approval",
-            f"{ctx.tool} requires human approval (approval id {aid}). "
+            f"{ctx.tool} requires human approval{f' ({why})' if why else ''} (approval id {aid}). "
             "Continue with other work; retry this exact call after it is approved.",
             approval_id=aid,
         )
@@ -370,8 +374,11 @@ class Guard:
 
     async def _audit(self, task_id: str, event: str, **fields: str) -> None:
         entry = {"ts": f"{time.time():.3f}", "event": event, **fields}
-        await self.redis.xadd(f"ag:audit:{task_id}", entry, maxlen=AUDIT_MAXLEN, approximate=True)
-        await self.redis.sadd("ag:tasks", task_id)
+        # One round-trip: the eval measured each extra Redis hop as ~1 ms of added latency.
+        async with self.redis.pipeline(transaction=False) as pipe:
+            pipe.xadd(f"ag:audit:{task_id}", entry, maxlen=AUDIT_MAXLEN, approximate=True)
+            pipe.sadd("ag:tasks", task_id)
+            await pipe.execute()
 
 
 # ---------------------------------------------------------------- approvals

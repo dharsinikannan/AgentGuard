@@ -67,6 +67,8 @@ def pending_panel() -> None:
             left, right = st.columns([4, 1])
             age = int(time.time() - req["requested_at"])
             left.markdown(f"**`{req['tool']}`** · task `{req['task_id']}` · waiting {age}s · id `{aid}`")
+            if req.get("reason"):
+                left.caption(f"why approval: {req['reason']}")
             left.code(json.dumps(req["args"], indent=2), language="json")
             if right.button("✅ Approve", key=f"approve-{aid}", use_container_width=True):
                 _decide(aid, True)

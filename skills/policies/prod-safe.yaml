@@ -19,6 +19,26 @@ require_approval:
 deny:
   - "cloud__*iam*"
 
+# Argument rules only tighten (allow -> require_approval -> deny), never loosen.
+# Born from real runs: the agent scaled api to 12 and the healthy db from 1 to 4.
+arg_rules:
+  - tool: cloud__scale_service
+    when: {replicas: {gt: 6}}
+    then: require_approval
+    reason: "more than 6 replicas is a capacity/cost decision for a human"
+  - tool: cloud__scale_service
+    when: {service: {ne: api}}
+    then: require_approval
+    reason: "only api is pre-approved for scaling"
+  - tool: cloud__create_instance
+    when: {instance_type: {not_in: [t3.micro, t3.medium]}}
+    then: deny
+    reason: "only small instance types"
+  - tool: "github__comment_*"
+    when: {body: {matches: '(?i)(password|secret|api[_-]?key|token)\s*[:=]'}}   # single quotes: no YAML escapes
+    then: deny
+    reason: "the comment looks like it contains a credential"
+
 # Rupees per call. "default" applies to tools with no explicit cost.
 tool_costs:
   cloud__create_instance: 250

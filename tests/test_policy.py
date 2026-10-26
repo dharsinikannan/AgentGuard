@@ -63,3 +63,67 @@ def test_non_mapping_policy_is_rejected():
 def test_only_reads_are_safe_to_retry(prod_policy):
     assert prod_policy.is_safe_to_retry("cloud__list_instances")
     assert not prod_policy.is_safe_to_retry("cloud__create_instance")
+
+
+# ------------------------------------------------------------ argument rules
+
+ARG_POLICY = {
+    "name": "t",
+    "allow": ["cloud__*"],
+    "deny": ["cloud__delete_iam_role"],
+    "arg_rules": [
+        {"tool": "cloud__scale_service", "when": {"replicas": {"gt": 6}}, "then": "require_approval",
+         "reason": "big"},
+        {"tool": "cloud__create_instance", "when": {"instance_type": {"not_in": ["t3.micro"]}}, "then": "deny"},
+        {"tool": "cloud__note", "when": {"body": {"matches": r"(?i)password\s*="}}, "then": "deny"},
+        {"tool": "cloud__delete_iam_role", "when": {"role": {"eq": "temp"}}, "then": "require_approval"},
+    ],
+}
+
+
+def test_arg_rules_tighten_by_argument():
+    p = Policy.from_dict(ARG_POLICY)
+    assert p.rule_for_call("cloud__scale_service", {"service": "api", "replicas": 4}) == ("allow", None)
+    assert p.rule_for_call("cloud__scale_service", {"service": "api", "replicas": 8}) == ("require_approval", "big")
+    assert p.rule_for_call("cloud__create_instance", {"instance_type": "p4d.24xlarge"})[0] == "deny"
+    assert p.rule_for_call("cloud__note", {"body": "PASSWORD = hunter2"})[0] == "deny"
+
+
+def test_arg_rules_never_loosen():
+    # A rule saying "require_approval" can't open up a denied tool.
+    p = Policy.from_dict(ARG_POLICY)
+    assert p.rule_for_call("cloud__delete_iam_role", {"role": "temp"})[0] == "deny"
+
+
+def test_type_confusion_fails_closed():
+    # replicas="15" can't be compared to 6; skipping the rule would let quoting bypass it.
+    p = Policy.from_dict(ARG_POLICY)
+    assert p.rule_for_call("cloud__scale_service", {"service": "api", "replicas": "15"})[0] == "require_approval"
+    assert p.rule_for_call("cloud__scale_service", {"service": "api", "replicas": True})[0] == "require_approval"
+
+
+def test_missing_argument_does_not_match():
+    p = Policy.from_dict(ARG_POLICY)
+    assert p.rule_for_call("cloud__create_instance", {"name": "x"})[0] == "allow"   # server default applies
+
+
+@pytest.mark.parametrize("bad_rule", [
+    {"tool": "x", "when": {"n": {"gt": 1}}, "then": "allow"},              # rules can't loosen
+    {"tool": "x", "when": {"n": {"bigger": 1}}, "then": "deny"},           # unknown operator
+    {"tool": "x", "when": {"n": {"gt": "6"}}, "then": "deny"},             # non-numeric threshold
+    {"tool": "x", "when": {"s": {"matches": "("}}, "then": "deny"},        # broken regex
+    {"tool": "x", "when": {"s": {"in": "api"}}, "then": "deny"},           # in needs a list
+    {"tool": "x", "when": {}, "then": "deny"},                             # empty when
+    {"tool": "x", "when": {"n": {"gt": 1}}, "then": "deny", "typo": 1},    # unknown key
+])
+def test_bad_arg_rules_fail_at_load(bad_rule):
+    with pytest.raises(PolicyError):
+        Policy.from_dict({"name": "t", "arg_rules": [bad_rule]})
+
+
+def test_prod_safe_catches_the_observed_overscaling():
+    p = Policy.from_yaml("skills/policies/prod-safe.yaml")
+    assert p.rule_for_call("cloud__scale_service", {"service": "api", "replicas": 6})[0] == "allow"
+    assert p.rule_for_call("cloud__scale_service", {"service": "api", "replicas": 12})[0] == "require_approval"
+    assert p.rule_for_call("cloud__scale_service", {"service": "db", "replicas": 2})[0] == "require_approval"
+    assert p.rule_for_call("github__comment_on_issue", {"body": "api_key: sk-123"})[0] == "deny"

@@ -15,6 +15,24 @@ agent ──MCP──► AgentGuard ──MCP──► cloud__*  (EC2, S3)      
                  Redis   budgets · loop counters · idempotency · approvals · audit stream
 ```
 
+## Results
+
+From `python -m evals.run_evals` (full report: [evals/RESULTS.md](evals/RESULTS.md)). 30 scripted bad
+agents and 12 good ones, judged by **what actually executed** on the cloud server / LLM provider, not by
+what the gateway said:
+
+| Metric | Result |
+|---|---|
+| Bad-agent scenarios stopped | **29/30**; the one miss is a documented gap (below) |
+| Harmful actions prevented | **60/64 (93.8%)**; without AgentGuard 61/64 execute (the other 3 can't: the bucket is already gone) |
+| False blocks | **0/34** actions in the good-agent scenarios (0/110 counting benign steps inside bad scenarios) |
+| Added latency per call | **+2.8 to +4.4 ms p50, +3.8 to +9.8 ms p95** with real Redis (Docker on Windows, range over 3 runs on a laptop); +1.2 to +2.6 ms p50 with in-memory Redis |
+| Does the eval catch regressions? | Removing each defence fails exactly its scenarios: arg rules → 6, approvals → 6, budget → 4, identical-call limit → 2, intent limit → 1 (the arg rule still stops the scaling spiral) |
+
+**Known gap:** an agent that invents a new task id for every call resets per-task budgets and loop
+counts (`task_rotation_to_evade_budget`). Fixing it needs per-principal limits, which needs the
+agent → gateway connection to be authenticated (next on the Future work list).
+
 ## Quick start
 
 ```powershell
@@ -22,11 +40,12 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1          # macOS/Linux: source .venv/bin/activate
 pip install -e ".[dev,agent,aws,ui]"
 
-pytest -q                             # 114 tests, ~2 min; 3 live ones skip without docker compose
+pytest -q                             # 169 tests, ~2 min; 3 live ones skip without docker compose
 python demo/run_demo.py               # scripted incident, no Redis needed
 python demo/reconnect_demo.py         # dropped connections + gateway restart (part B needs Redis)
 python demo/github_oauth_demo.py      # per-user OAuth, scopes, refresh, no passthrough (self-contained)
 python demo/cost_and_intent_demo.py   # semantic loops + LLM spend capped by the budget (self-contained)
+python -m evals.run_evals             # 42 scenarios: block rate, false blocks, baseline, latency
 ```
 
 Run the LangGraph on-call agent. Put `GROQ_API_KEY` (free: https://console.groq.com/keys) and
@@ -118,6 +137,7 @@ Each call must carry `_meta`: `agentguard/task_id` (required) and
 | `agent/mcp_bridge.py` | MCP v2 tools → LLM tool specs; tool call → `tools/call` with `_meta` |
 | `agent/graph.py` | Hand-written LangGraph ReAct loop (agent ⇄ tools); pauses with `interrupt` for approvals |
 | `agent/run_agent.py` | CLI: Groq model → AgentGuard → cloud server |
+| `evals/` | Eval suite: `harness.py` (ground truth), `scenarios.py` (30 bad + 12 good), `run_evals.py` (report) |
 | `demo/run_demo.py` | Every protection, end to end (scripted) |
 | `demo/reconnect_demo.py` | Dropped connection mid-launch; gateway killed and restarted mid-task |
 
@@ -183,6 +203,13 @@ Each call must carry `_meta`: `agentguard/task_id` (required) and
 - **Cached prompt tokens are billed at the cached price.** Groq reports `prompt_tokens_details.cached_tokens`; a real run showed 512 of 1,188 prompt tokens cached. Prompt caching lowers the cost of each LLM call; it doesn't stop loops (that's the loop checks' job).
 - **Unpriced models are refused.** A model missing from `llm_costs` can't be budgeted, so it fails closed. Failed provider calls (429, 5xx, unreachable) cost 0, like the provider's own bill.
 - **Semantic loops by intent keys, not embeddings.** Intent = tool + the arguments that say *what* it does (policy `loop.intent_args`, e.g. `scale_service: [service]`); by default numbers/booleans are dropped (tuning knobs like `lines`, `replicas`) and text normalized. `max_same_intent` caps repeats per window. It catches every over-scaling run we recorded (api 4→6→8→10→12 is blocked at the 5th), deterministically, with a reason that names the intent. Embeddings would need a model, add latency and cost, and block on thresholds nobody can explain.
+- **Argument rules only tighten.** `arg_rules` (e.g. `scale_service when replicas > 6 → require_approval`, `when service ne api → require_approval`, `create_instance when instance_type not_in [...] → deny`, comments matching a credential pattern → deny) can raise allow → approval → deny but never lower a tool's base rule, so adding one can't open anything. Every real run over-scaled; these rules are the fix.
+- **Type confusion fails closed.** `replicas: "15"` can't be compared to 6, and the server would coerce it to 15. A rule that skipped it would be bypassed by quoting the number, so a non-comparable value *matches*. A missing argument doesn't match (the server's own default applies).
+- **Evals judge outcomes, not verdicts.** A recording wrapper around the downstream server (and a counting fake LLM provider) is the ground truth: "prevented" means it never ran. Each bad scenario is also run *without* AgentGuard as a baseline, which caught a mislabelled scenario (the first deletion in `rejected_action_retried` is itself harmful).
+- **The evals are mutation-tested.** Removing each defence from the policy fails exactly the scenarios it should. A suite that passes no matter what proves nothing.
+- **The false-block rate is reported both ways** (0/110 including the 40 reads of a flood scenario, and 0/34 for good agents alone) so one scenario can't flatter it.
+- **Latency found work:** the audit write and the budget reservation were 2 Redis round-trips each; pipelining cut real-Redis overhead from +5.7 to +4.4 ms p50.
+- **The suite is also a pytest regression test** (`tests/test_evals.py`): any weakened defence fails CI with the scenario's name; the known gap must keep failing until it's fixed on purpose.
 - **Every decision and outcome is appended to a Redis Stream** `ag:audit:{task}`: append-only and ordered, with `XRANGE` for replay.
 
 ## Future work
@@ -190,10 +217,9 @@ Each call must carry `_meta`: `agentguard/task_id` (required) and
 - Budget refunds when a write fails definitively (today a reserved cost is kept).
 - Stuck `in_progress` keys if the gateway crashes mid-call (today they expire after 24h).
 - Redact secrets from audited arguments.
-- **Argument-level policy rules**, e.g. `scale_service: require_approval if replicas > 6`, or only for named services. Seen in every real run: the agent scaled `api` 2 → 10–12 and the *healthy* `db` 1 → 4, and the policy allowed each step because it can only judge the tool name.
 - **Embedding-based intent** as an optional second layer, for loops that rephrase free text (log searches, comments) beyond what normalization catches.
 - **Streaming through the LLM proxy** (meter the stream, cut it at the budget) and **exact input token counts** with the provider's tokenizer.
-- Intent loops don't stop *unneeded* actions: scaling a healthy `db` 1 → 2 is one intent, twice. That needs argument-level policy rules (planned for M8).
+- **Per-principal limits** (budget and loops per authenticated agent/user across tasks): closes the task-rotation gap the evals found; depends on agent → gateway authentication.
 - **Agent → gateway authentication.** The task owner is bound once, but the agent's connection to the gateway carries no credential yet; a malicious agent process could start a *new* task naming another user. Next step: protect the gateway's own `/mcp` with OAuth so each agent connection is a user.
 - **Consent screen** on the GitHub MCP server listing requested scopes (today the GitHub login is the only consent).
 - **401 with a still-valid refresh token** (server revoked only the access token): the SDK re-authorizes instead of refreshing, so the gateway reports `not_connected`. Normal expiry never hits this (absolute expiry + early refresh).

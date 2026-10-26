@@ -47,8 +47,11 @@ async def test_overscaling_is_a_semantic_loop(redis):
                                                {"service": "api", "replicas": n}))).verdict
                 for n in (4, 6, 8, 10, 12)]
     db = await guard.check(CallContext("t1", "cloud__scale_service", {"service": "db", "replicas": 2}))
-    assert verdicts == [Verdict.ALLOW] * 4 + [Verdict.DENY]
-    assert db.verdict is Verdict.ALLOW                 # a different intent has its own count
+    # Layered (M8): replicas > 6 needs a human (argument rule) before the 5th attempt
+    # trips the intent limit; scaling db is a different intent but needs approval too.
+    assert verdicts == [Verdict.ALLOW, Verdict.ALLOW, Verdict.PENDING_APPROVAL, Verdict.PENDING_APPROVAL,
+                        Verdict.DENY]
+    assert db.verdict is Verdict.PENDING_APPROVAL
 
 
 async def test_semantic_loop_reason_names_the_intent(redis):
